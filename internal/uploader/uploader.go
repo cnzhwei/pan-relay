@@ -1,0 +1,275 @@
+package uploader
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/cnzhwei/wopan-cli/internal/client"
+	"github.com/xhofe/wopan-sdk-go"
+)
+
+const (
+	DefaultPartSize = int64(8 * 1024 * 1024) // 8MB per WoPan spec
+)
+
+type UploadOptions struct {
+	Concurrency int
+	Retries     int
+	ShowProgress bool
+}
+
+type PartTask struct {
+	PartIndex int64
+	PartSize  int64
+	Offset    int64
+}
+
+func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID string, opt UploadOptions) (string, error) {
+	if opt.Concurrency <= 0 {
+		opt.Concurrency = 4
+	}
+	if opt.Retries <= 0 {
+		opt.Retries = 3
+	}
+
+	f, err := os.Open(localPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open local file: %w", err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("failed to stat local file: %w", err)
+	}
+
+	fileName := filepath.Base(localPath)
+	fileSize := fi.Size()
+
+	if targetDirID == "" {
+		targetDirID = "0"
+	}
+
+	rawClient := c.Raw()
+	zoneURL := "https://tjupload.pan.wo.cn"
+	if rawClient.ZoneURL != "" {
+		zoneURL = rawClient.ZoneURL
+	}
+	uploadURL := zoneURL + "/openapi/client/" + wopan.KeyUpload2C
+
+	// 1. Calculate parts
+	totalPart := int64(math.Ceil(float64(fileSize) / float64(DefaultPartSize)))
+	if totalPart == 0 {
+		totalPart = 1
+	}
+
+	// 2. Prepare encrypted fileInfo
+	batchNo := time.Now().Format("20060102150405")
+	fileInfo := wopan.Json{
+		"spaceType":   c.SpaceType(),
+		"directoryId": targetDirID,
+		"batchNo":     batchNo,
+		"fileName":    fileName,
+		"fileSize":    fileSize,
+		"fileType":    rawClient.GetFileType(fileName),
+	}
+	if c.SpaceType() == wopan.SpaceTypeFamily {
+		fileInfo["familyId"] = c.Config().FamilyID
+	}
+
+	fileInfoStr, err := rawClient.EncryptParam(wopan.ChannelWoHome, fileInfo)
+	if err != nil {
+		return "", fmt.Errorf("failed to encrypt fileInfo: %w", err)
+	}
+
+	randomSuffix := make([]byte, 3)
+	_, _ = rand.Read(randomSuffix)
+	uniqueID := fmt.Sprintf("%d_%s", time.Now().UnixMilli(), hex.EncodeToString(randomSuffix))
+
+	// Progress tracking
+	var completedBytes atomic.Int64
+	startTime := time.Now()
+	var finalFid string
+	var fidMu sync.Mutex
+
+	// Print starting banner
+	fmt.Printf("Uploading %s (%.2f MB) -> WoPan Dir [%s] with %d threads...\n",
+		fileName, float64(fileSize)/(1024*1024), targetDirID, opt.Concurrency)
+
+	// Channel for parts
+	tasksChan := make(chan PartTask, totalPart)
+	for p := int64(1); p <= totalPart; p++ {
+		offset := (p - 1) * DefaultPartSize
+		partSize := DefaultPartSize
+		if p == totalPart {
+			partSize = fileSize - offset
+		}
+		tasksChan <- PartTask{
+			PartIndex: p,
+			PartSize:  partSize,
+			Offset:    offset,
+		}
+	}
+	close(tasksChan)
+
+	// Progress ticker
+	doneTicker := make(chan struct{})
+	if opt.ShowProgress {
+		go func() {
+			ticker := time.NewTicker(400 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-doneTicker:
+					return
+				case <-ticker.C:
+					done := completedBytes.Load()
+					pct := float64(done) / float64(fileSize) * 100
+					if pct > 100 {
+						pct = 100
+					}
+					elapsed := time.Since(startTime).Seconds()
+					speedMB := (float64(done) / (1024 * 1024)) / elapsed
+					fmt.Printf("\r  Progress: %5.1f%% (%6.1f / %6.1f MB) | Speed: %5.2f MB/s | Elapsed: %.0fs",
+						pct, float64(done)/(1024*1024), float64(fileSize)/(1024*1024), speedMB, elapsed)
+				}
+			}
+		}()
+	}
+
+	// Concurrency worker group
+	var wg sync.WaitGroup
+	errChan := make(chan error, opt.Concurrency)
+	workerCount := opt.Concurrency
+	if int64(workerCount) > totalPart {
+		workerCount = int(totalPart)
+	}
+
+	for wID := 0; wID < workerCount; wID++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Each worker has its own read handle to avoid file seek races
+			workerFile, err := os.Open(localPath)
+			if err != nil {
+				select {
+				case errChan <- err:
+				default:
+				}
+				return
+			}
+			defer workerFile.Close()
+
+			for task := range tasksChan {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// Upload part with retries
+				var partErr error
+				for attempt := 0; attempt <= opt.Retries; attempt++ {
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+
+					var resp wopan.Upload2CResp
+					formData := map[string]string{
+						"uniqueId":    uniqueID,
+						"accessToken": c.Config().AccessToken,
+						"fileName":    fileName,
+						"psToken":     "undefined",
+						"fileSize":    strconv.FormatInt(fileSize, 10),
+						"totalPart":   strconv.FormatInt(totalPart, 10),
+						"channel":     wopan.ChannelWoCloud,
+						"directoryId": targetDirID,
+						"fileInfo":    fileInfoStr,
+						"partSize":    strconv.FormatInt(task.PartSize, 10),
+						"partIndex":   strconv.FormatInt(task.PartIndex, 10),
+					}
+
+					partReader := io.NewSectionReader(workerFile, task.Offset, task.PartSize)
+
+					req := rawClient.NewRequest().
+						SetResult(&resp).
+						ForceContentType("application/json;charset=UTF-8").
+						SetHeaders(map[string]string{
+							"Origin":     "https://pan.wo.cn",
+							"Referer":    "https://pan.wo.cn/",
+							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+						}).
+						SetMultipartFormData(formData).
+						SetMultipartField("file", fileName, "application/octet-stream", partReader)
+
+					res, reqErr := req.Post(uploadURL)
+					if reqErr != nil {
+						partErr = reqErr
+						time.Sleep(time.Duration(attempt+1) * time.Second)
+						continue
+					}
+					if res.StatusCode() != http.StatusOK {
+						partErr = fmt.Errorf("part %d HTTP status %d: %s", task.PartIndex, res.StatusCode(), res.String())
+						time.Sleep(time.Duration(attempt+1) * time.Second)
+						continue
+					}
+					if resp.Code != "0000" {
+						partErr = fmt.Errorf("part %d WoPan code %s: %s", task.PartIndex, resp.Code, resp.Msg)
+						time.Sleep(time.Duration(attempt+1) * time.Second)
+						continue
+					}
+
+					// Part succeeded
+					partErr = nil
+					if resp.Data.Fid != "" {
+						fidMu.Lock()
+						finalFid = resp.Data.Fid
+						fidMu.Unlock()
+					}
+					completedBytes.Add(task.PartSize)
+					break
+				}
+
+				if partErr != nil {
+					select {
+					case errChan <- fmt.Errorf("part %d failed after retries: %w", task.PartIndex, partErr):
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(doneTicker)
+
+	select {
+	case err := <-errChan:
+		fmt.Printf("\n[!] Upload failed: %v\n", err)
+		return "", err
+	default:
+	}
+
+	totalTime := time.Since(startTime).Seconds()
+	avgSpeed := (float64(fileSize) / (1024 * 1024)) / totalTime
+	fmt.Printf("\r  Progress: 100.0%% (%6.1f / %6.1f MB) | Avg Speed: %5.2f MB/s | Total Time: %.1fs\n",
+		float64(fileSize)/(1024*1024), float64(fileSize)/(1024*1024), avgSpeed, totalTime)
+	fmt.Printf("[✓] Upload completed successfully! (FID: %s)\n", finalFid)
+
+	return finalFid, nil
+}

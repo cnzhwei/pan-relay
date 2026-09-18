@@ -1,0 +1,8 @@
+bin/
+dist/
+*.tmp
+*.bin
+wopan_config.json
+.wopan_config.json
+credentials.json
+.DS_Store
