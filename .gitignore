@@ -2,7 +2,11 @@ bin/
 dist/
 *.tmp
 *.bin
-wopan_config.json
-.wopan_config.json
+*.log
+*.token
+*.cookie
+*.json
+!go.mod
+!go.sum
 credentials.json
 .DS_Store
