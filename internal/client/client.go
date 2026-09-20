@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cnzhwei/wopan-cli/internal/config"
+	"github.com/cnzhwei/pan-relay/internal/config"
 	"github.com/go-resty/resty/v2"
 	"github.com/xhofe/wopan-sdk-go"
 )

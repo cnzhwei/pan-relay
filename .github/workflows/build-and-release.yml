@@ -20,16 +20,16 @@ jobs:
         include:
           - os: linux
             arch: amd64
-            artifact_name: wopan-cli-linux-amd64
+            artifact_name: pan-relay-linux-amd64
           - os: linux
             arch: arm64
-            artifact_name: wopan-cli-linux-arm64
+            artifact_name: pan-relay-linux-arm64
           - os: darwin
             arch: arm64
-            artifact_name: wopan-cli-darwin-arm64
+            artifact_name: pan-relay-darwin-arm64
           - os: windows
             arch: amd64
-            artifact_name: wopan-cli-windows-amd64.exe
+            artifact_name: pan-relay-windows-amd64.exe
 
     steps:
       - name: Checkout Code

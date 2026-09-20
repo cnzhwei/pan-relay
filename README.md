@@ -1,132 +1,164 @@
-# wopan-cli
+# pan-relay
 
 <p align="center">
-  <strong>沃家云盘（WoPan）与夸克网盘（Quark）轻量级多线程命令行中转工具</strong>
+  <strong>全能多网盘轻量多线程中转与命令行同步工具</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/cnzhwei/wopan-cli/releases"><img src="https://img.shields.io/github/v/release/cnzhwei/wopan-cli?color=blue&logo=github" alt="Release"></a>
-  <a href="https://github.com/cnzhwei/wopan-cli/actions"><img src="https://img.shields.io/github/actions/workflow/status/cnzhwei/wopan-cli/build-and-release.yml?logo=github&label=build" alt="Build Status"></a>
-  <a href="https://github.com/cnzhwei/wopan-cli/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
+  <a href="https://github.com/cnzhwei/pan-relay/releases"><img src="https://img.shields.io/github/v/release/cnzhwei/pan-relay?color=blue&logo=github" alt="Release"></a>
+  <a href="https://github.com/cnzhwei/pan-relay/actions"><img src="https://img.shields.io/github/actions/workflow/status/cnzhwei/pan-relay/build-and-release.yml?logo=github&label=build" alt="Build Status"></a>
+  <a href="https://github.com/cnzhwei/pan-relay/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/Language-Go%201.24-blue.svg?logo=go" alt="Go Version">
   <img src="https://img.shields.io/badge/Arch-x86__64%20%7C%20arm64-orange.svg" alt="Architecture">
 </p>
 
 ---
 
-## 📖 项目背景与定位
+## 📖 项目定位与更名演进
 
-在构建家庭影音库（Emby / Jellyfin / Plex）的影视中转与云端归档方案时，许多用户使用海外 VPS 或轻量主机作为“下载与转存节点”：
-- **资源来源**：通常保存在**夸克网盘（Quark）**分享合集或个人空间中；
-- **归档终点**：归档到不限速、不计家宽上传流量的**中国联通沃家云盘（WoPan）**。
+在家庭影音自动化（Emby / Jellyfin / Plex）与云端资产归档的实际场景中，影视与媒体资源往往分散在多个公共云盘中（如**夸克网盘**分享、**百度网盘**资源库），而最终的稳定高速播放源则归档在不限速、不耗费家庭宽带上传流量的**中国联通沃家云盘（WoPan）**。
 
-过去在 VPS 上跑这套流程，通常需要搭建 **OpenList** 或 **Alist**。但常驻 Web 服务存在明显的痛点：
-1. **服务沉重**：Alist / OpenList 包含完整的 Web 前端、多种存储驱动适配层、数据库（SQLite/MySQL）和后台 Daemon，常驻占用 150MB~300MB 内存；
-2. **大文件下载单线程限速**：夸克 Web 端对非 VIP 有大小限制，单连接易被限速；
-3. **流程割裂**：需要手动登录后台、触发复制、观察队列，一旦中转机到期更换就得重搭一遍环境。
+本项目最初为针对沃家云盘的轻量客户端（`wopan-cli`）。随着夸克网盘大文件绕过机制、跨盘全自动 Relay 接力流水线、以及**百度网盘（Baidu Netdisk）**双模组件的全面加入，工具已演进为通用的**多网盘中转与同步中心**，正式更名为 **`pan-relay`**。
 
-**`wopan-cli` 为此打造：**
-它是一个**独立的、单静态二进制、即开即用**的命令行中转工具。**不带 Web 界面、不依赖数据库、无任何外部依赖**：
-- **沃家模块**：支持 8MB 分片多线程并发推流，自动换新凭据；
-- **夸克模块**：模拟 PC 客户端 UA，**彻底绕过 Web 端大文件下载限制**，支持 HTTP `Range` 多连接并发分段拉取；
-- **一键中转 Relay**：支持 `wopan-cli relay quark:/电影.mkv wopan:/emby/movies/`，自动完成“夸克多线程下载 -> 沃家多线程推流 -> 自动删除本地缓存”，专为低配小硬盘 VPS 量身定制！
+### 为什么选择 `pan-relay` 而不是传统 Alist / OpenList？
+
+| 对比维度 | 传统 Alist / OpenList | **pan-relay** |
+| :--- | :--- | :--- |
+| **运行时依赖** | 强依赖 Web 容器、SQLite/MySQL 数据库、Node/Web 前端 | **零依赖，纯静态单一可执行文件（约 7MB）** |
+| **内存与资源** | 常驻占用 150MB ~ 300MB+ 内存 | **运行即起、传输即走，空闲 0 内存占用** |
+| **跨系统兼容** | 需要 Docker 或特定 Linux 发行版依赖 | **原生兼容 Alpine（musl）与 Debian/Ubuntu（glibc）** |
+| **跨盘中转** | 手动登录 Web 界面配置复制任务，需配置公网端口 | **命令行单行直接调用 (`relay`)，支持脚本批量管道** |
+| **小盘 VPS 容灾** | 批量任务容易撑爆中转 VPS 本地临时磁盘 | **严格串行接力，传输校验后秒删本地暂存，绝不爆盘** |
+| **下载限制绕过** | 夸克 Web 端受限几百 MB，百度受限普通单线程 | **客户端原生指纹封装 + HTTP Range 多连接分段并发加速** |
 
 ---
 
 ## ✨ 核心特性
 
-- **🚀 单静态绿色二进制**：Go 语言原生开发，`CGO_ENABLED=0` 纯静态编译，零外部动态库依赖。在 **Alpine Linux（musl）**、**Debian / Ubuntu（glibc）**、CentOS 及 macOS 上扔进去直接就能跑；
-- **⚡ 沃家 8MB 分块并发上传**：基于联通云盘底层 `upload2C` 协议，Goroutine 线程池并发上传，跑满 VPS 往联通机房的上行带宽；
-- **📥 夸克多线程分段并发下载**：模拟 Quark-Cloud-Drive 客户端凭据通道，解除网页端大文件限制，多线程 HTTP `Range` 并发拉取并自动合并；
-- **🔄 一键全自动中转流水线 (`relay`)**：支持从夸克指定目录/文件一键拉取并直推沃家云盘，完成后自动销毁本地临时文件，适合几 GB 磁盘的小鸡中转动辄几十 GB 的大合集；
-- **📊 实时终端速度看板**：传输过程中平滑输出完成百分比、已传大小、平均传输速率（MB/s）及耗时统计；
-- **🔑 Token 自动续期与持久化闭环**：基于 `refresh_token` 实现永久免密免登录。短效 Token 过期自动换新并写回本地配置文件。
+- **🚀 纯静态绿色二进制**：Go 原生开发，`CGO_ENABLED=0` 静态编译。在 **Alpine Linux（musl / Busybox）**、**Debian / Ubuntu**、CentOS 及 macOS 上复制即用；
+- **🔄 一键全自动跨盘中转流水线 (`relay`)**：
+  - 支持 `quark -> wopan`、`baidu -> wopan` 单行命令调度；
+  - 自动完成“源网盘多线程高速拉取 -> 目标网盘多线程切片推流 -> 远端校验 -> 自动彻底删除本地临时缓存”全闭环；
+- **📦 沃家云盘 (WoPan) 核心**：
+  - 基于联通底层 8MB 切片（`upload2C`）并发推流，跑满海外 VPS 往国内联通骨干网物理上行；
+  - 基于 `refresh_token` 实现长效自动换新短效 Token，一次配置终身免维护；
+- **📥 夸克网盘 (Quark) 原生组件**：
+  - 深度模拟 Quark-Cloud-Drive 官方 PC 客户端 UA 与加密签名，**彻底绕过非 VIP 网页端大文件下载限制**；
+  - 多线程 HTTP Range 并发拉取并自动合并；
+- **🛡️ 百度网盘 (Baidu Netdisk) 双模支持**：
+  - **模式一（Cookie / BDUSS）**：直接粘贴浏览器抓取的 Cookie 即可高速拉取，免去申请开发者 App 的繁琐认证；
+  - **模式二（开放平台 OAuth）**：支持官方 `access_token` 与 `refresh_token` 标准鉴权；
+  - 支持多线程并发下载大文件；
+- **📊 实时终端速度看板**：传输过程中平滑输出完成百分比、已完成/总大小、平均传输速率（MB/s）及耗时统计。
 
 ---
 
 ## 📦 快速安装
 
-### 方式一：一键自动安装（推荐）
+### 方式一：一键自动安装（最推荐）
 
-适用于任何 **Linux（x86_64 / aarch64）** 或 **macOS（Apple Silicon）**，自动识别架构并安装至 `/usr/local/bin`：
+在任何 **Linux（x86_64 / aarch64）** 或 **macOS（Apple Silicon）** 上执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cnzhwei/wopan-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cnzhwei/pan-relay/main/install.sh | sh
 ```
 
-### 方式二：手动下载 Release 预编译包
+### 方式二：从 Release 手动下载
 
-从 [GitHub Releases 页面](https://github.com/cnzhwei/wopan-cli/releases) 下载：
+前往 [GitHub Releases 页面](https://github.com/cnzhwei/pan-relay/releases) 下载最新预编译包：
 
 ```bash
-# Linux x86_64 为例：
-curl -sL https://github.com/cnzhwei/wopan-cli/releases/latest/download/wopan-cli-linux-amd64.tar.gz | tar -xz
-chmod +x wopan-cli
-sudo mv wopan-cli /usr/local/bin/
+# 以 Linux x86_64 为例：
+curl -sL https://github.com/cnzhwei/pan-relay/releases/latest/download/pan-relay-linux-amd64.tar.gz | tar -xz
+chmod +x pan-relay
+sudo mv pan-relay /usr/local/bin/
 ```
 
 ---
 
-## 🔐 凭据配置指南
+## 🔐 凭据配置说明
 
-`wopan-cli` 的凭据均可独立配置，按需加载。
+各网盘凭据相互独立，按需配置。
 
 ### 1. 沃家云盘凭据 (`wopan_config.json`)
 
-配置文件查找顺序：命令行 `-c` > 当前目录 `./wopan_config.json` > `~/.config/wopan-cli/config.json` > 环境变量 `WOPAN_REFRESH_TOKEN`。
-
-**获取方式：** 从现有 OpenList/Alist 存储编辑页面复制 `刷新令牌 (refresh_token)`。
+查找顺序：命令行 `-c` > `./wopan_config.json` > `~/.config/pan-relay/wopan.json` > 环境变量 `WOPAN_REFRESH_TOKEN`。
 ```json
 {
-  "refresh_token": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "refresh_token": "你的-refresh-token-uuid",
   "zone_url": "https://tjupload.pan.wo.cn"
 }
 ```
 
 ### 2. 夸克网盘凭据 (`quark_config.json`)
 
-配置文件查找顺序：命令行 `--quark-config` > 当前目录 `./quark_config.json` > `~/.config/wopan-cli/quark.json` > 环境变量 `QUARK_COOKIE`。
-
-**获取方式：** 
-- 从已有 Alist/OpenList 的 `/quark` 存储配置中复制完整 `cookie`；
-- 或在电脑浏览器登录 [pan.quark.cn](https://pan.quark.cn/)，按 `F12` 复制 Cookie。
+查找顺序：命令行 `--quark-config` > `./quark_config.json` > `~/.config/pan-relay/quark.json` > 环境变量 `QUARK_COOKIE`。
 ```json
 {
   "cookie": "_UP_A4A_11_=...; __puus=...; __pus=..."
 }
 ```
 
+### 3. 百度网盘凭据 (`baidu_config.json`)
+
+查找顺序：命令行 `--baidu-config` > `./baidu_config.json` > `~/.config/pan-relay/baidu.json` > 环境变量 `BAIDU_COOKIE` / `BAIDU_ACCESS_TOKEN`。
+
+- **方式 A（推荐：网页 Cookie 免配置）**：
+  在浏览器登录 `pan.baidu.com`，F12 复制 Cookie 字符串（包含 `BDUSS=...`）：
+  ```json
+  {
+    "cookie": "BDUSS=xxxxxx; STOKEN=yyyyyy"
+  }
+  ```
+- **方式 B（官方开放平台 / Alist 模式）**：
+  ```json
+  {
+    "access_token": "126.xxxxxx",
+    "refresh_token": "127.yyyyyy",
+    "client_id": "你的-App-Key",
+    "client_secret": "你的-App-Secret"
+  }
+  ```
+
 ---
 
 ## 🛠️ 详细命令手册
 
 全局通用参数：
-- `-c, --config <path>`：指定 WoPan 配置文件路径；
-- `--quark-config <path>`：指定 Quark 配置文件路径；
-- `-t, --threads <num>`：并发线程数（默认 4，推荐 4~8）。
+- `-c, --config <path>`：指定 WoPan 配置文件；
+- `--quark-config <path>`：指定 Quark 配置文件；
+- `--baidu-config <path>`：指定 Baidu 配置文件；
+- `-t, --threads <num>`：并发线程数（默认 4，推荐 4~8）；
+- `-h, --help`：查看帮助；
+- `version`：查看当前版本。
 
 ---
 
-### 一、 跨网盘全自动中转 (`relay`) —— 最强功能！
+### 一、 跨网盘一键极速中转流水线 (`relay`) —— 最强核心！
 
-自动从夸克下载指定文件，边传边缓冲，上传沃家云盘成功后自动销毁本地临时切片：
+在 VPS 上单行命令拉取源盘资源直推目标网盘，完成后自动销毁本地切片：
 
 ```bash
-# 从夸克指定路径中转到沃家云盘 /emby/movies/ 目录 (6线程并发)
-wopan-cli relay quark:/来自：分享/山海情/EP01.mkv wopan:/emby/tv/山海情/ -t 6
+# 1. 从夸克拉取电影中转到沃家云盘 /emby/movies/ 目录 (6线程并发)
+pan-relay relay quark:/来自：分享/山海情/EP01.mkv wopan:/emby/tv/山海情/ -t 6
 
-# 支持使用夸克文件 FID 进行中转
-wopan-cli relay quark:56c288c923b74cc88f2ffcc08292310c wopan:/emby/movies/ -t 4
+# 2. 从百度网盘中转到沃家云盘
+pan-relay relay baidu:/我的影视/奥本海默.2023.mkv wopan:/emby/movies/ -t 6
+
+# 3. 支持通过夸克 FID 直接中转
+pan-relay relay quark:56c288c923b74cc88f2ffcc08292310c wopan:/emby/movies/ -t 4
 ```
-*中转过程输出看板：*
-```text
-[Relay Pipeline] Starting relay: Quark [EP01.mkv] -> WoPan [/emby/tv/山海情/] (Threads: 6)
-[Stage 1/2] Downloading from Quark...
-  Progress: 100.0% ( 3273.8 / 3273.8 MB) | Avg Speed: 24.50 MB/s | Total Time: 133.6s
-[✓] Download completed successfully: /tmp/wopan_relay_12891_EP01.mkv
 
-[Stage 2/2] Uploading to WoPan...
-  Progress: 100.0% ( 3273.8 / 3273.8 MB) | Avg Speed: 18.20 MB/s | Total Time: 179.8s
+*中转过程输出效果：*
+```text
+[Relay Pipeline] Starting relay: QUARK [EP01.mkv] -> WOPAN [/emby/tv/山海情/] (Threads: 6)
+
+[Stage 1/2] Downloading from QUARK...
+  Progress: 100.0% ( 1931.8 / 1931.8 MB) | Avg Speed: 22.40 MB/s | Total Time: 86.2s
+[✓] Download completed successfully: /tmp/relay_14205_EP01.mkv
+
+[Stage 2/2] Uploading to WOPAN...
+  Progress: 100.0% ( 1931.8 / 1931.8 MB) | Avg Speed: 18.50 MB/s | Total Time: 104.4s
 [✓] Upload completed successfully! (FID: glQtb_bUmsOlrwu6/LsURAxk4S7Qr69U)
 
 [✓] Relay completed! Local temporary staging file deleted automatically.
@@ -134,62 +166,87 @@ wopan-cli relay quark:56c288c923b74cc88f2ffcc08292310c wopan:/emby/movies/ -t 4
 
 ---
 
-### 二、 夸克网盘组件命令 (`quark`)
+### 二、 百度网盘独立操作 (`baidu`)
 
 ```bash
-# 1. 浏览夸克网盘根目录
-wopan-cli quark ls /
+# 浏览百度网盘指定目录
+pan-relay baidu ls /
+pan-relay baidu ls /我的影视
 
-# 2. 浏览指定目录层级 (支持中文路径)
-wopan-cli quark ls /来自：分享/山海情
+# 多线程并发高速下载百度网盘文件
+pan-relay baidu download /我的影视/电影名.mkv /data/movies/ -t 6
 
-# 3. 多线程并发从夸克下载文件 (绕过 Web 文件大小限制)
-wopan-cli quark download /来自：分享/电影名.mkv ./ -t 6
-
-# 4. 根据文件 FID 直接多线程下载
-wopan-cli quark download 56c288c923b74cc88f2ffcc08292310c /data/movies/ -t 8
+# 百度网盘创建目录与删除文件
+pan-relay baidu mkdir /我的影视 "经典纪录片"
+pan-relay baidu rm /我的影视/已废弃文件.mkv
 ```
 
 ---
 
-### 三、 沃家云盘核心命令 (`wopan`)
+### 三、 夸克网盘独立操作 (`quark`)
 
 ```bash
-# 1. 检查账号状态与空间
-wopan-cli whoami
+# 浏览夸克网盘目录
+pan-relay quark ls /来自：分享
 
-# 2. 浏览沃家网盘目录
-wopan-cli ls /emby/movies
-
-# 3. 多线程并发上传本地文件到沃家网盘
-wopan-cli upload /data/movies/Interstellar.2014.mkv /emby/movies/ -t 6
-
-# 4. 多线程下载沃家网盘文件 (支持 Range 分段加速)
-wopan-cli download /emby/movies/Interstellar.2014.mkv ./ -t 4
-
-# 5. 远程创建与删除目录
-wopan-cli mkdir /emby/movies "科幻电影"
-wopan-cli rm 51bd55b3ad2f4dd49cd5d01ab81194ac
-
-# 6. 主动触发凭据轮转刷新
-wopan-cli refresh
+# 多线程并发下载到本地（自动绕过大文件限制）
+pan-relay quark download /来自：分享/电影名.mkv ./ -t 6
 ```
 
 ---
 
-## ❓ 常见问题 (FAQ)
+### 四、 沃家云盘独立操作 (`wopan`)
 
-#### Q1: 夸克网盘报错 `download file size limit` 是怎么回事？
-**答：** 夸克对 Web 端限制普通用户下载超过几百 MB 的大文件。`wopan-cli` 内部完整模拟了官方 PC 客户端专用 UA 与加密签名通道，在服务端直接被识别为客户端握手，因此支持免 VIP 下载几十 GB 的原画视频！
+```bash
+# 检查账号信息与空间容量
+pan-relay wopan whoami
 
-#### Q2: 夸克的 Cookie 会过期吗？
-**答：** 夸克 Cookie 中的核心鉴权是 `__puus` / `__pus`。`wopan-cli` 在每次调用 API 时，如果检测到服务端响应了更新后的 Set-Cookie，会**自动更新并回写本地的 `quark_config.json`**，具备半持久保活能力。
+# 浏览沃家网盘目录
+pan-relay wopan ls /emby/movies
 
-#### Q3: 中转大文件会不会撑爆 VPS 磁盘？
-**答：** 使用 `wopan-cli relay` 时，任务是逐文件串行接力进行的：单个文件拉取完毕后立即推送到沃家，推流完毕校验通过后**立即将本地切片彻底删除**。只要 VPS 剩余磁盘大于最大的单个视频文件（例如保留 15GB 空间），就能源源不断中转完几百 GB 的剧集！
+# 多线程并发上传本地文件
+pan-relay wopan upload /data/movies/Interstellar.2014.mkv /emby/movies/ -t 6
+
+# 多线程分段下载文件
+pan-relay wopan download /emby/movies/Interstellar.2014.mkv ./ -t 4
+
+# 目录创建与删除
+pan-relay wopan mkdir /emby/movies "科幻电影"
+pan-relay wopan rm 51bd55b3ad2f4dd49cd5d01ab81194ac
+
+# 主动换新凭据
+pan-relay wopan refresh
+```
+
+---
+
+## 🎬 自动化影视中转脚本实战
+
+在海外中转 VPS 上编写简单的定时或监听流水线：
+
+```bash
+#!/usr/bin/env bash
+# 影视自动中转: 遍历待转清单逐一推送到沃家云盘
+set -euo pipefail
+
+LIST=(
+  "quark:/来自：分享/英雄联盟：双C之战/S01/01.mkv"
+  "quark:/来自：分享/英雄联盟：双C之战/S01/02.mkv"
+  "baidu:/4K影视/流浪地球2.mkv"
+)
+
+TARGET_DIR="/emby/movies"
+
+for item in "${LIST[@]}"; do
+    echo "=================================================="
+    echo "开始中转任务: $item -> $TARGET_DIR"
+    pan-relay relay "$item" "wopan:$TARGET_DIR" -t 6
+    echo "任务完成，本地磁盘零残留！"
+done
+```
 
 ---
 
 ## 📄 开源许可证
 
-本项目基于 [MIT 许可证](https://github.com/cnzhwei/wopan-cli/blob/main/LICENSE) 开源。欢迎 Star、Fork 与提交 PR！
+本项目基于 [MIT 许可证](https://github.com/cnzhwei/pan-relay/blob/main/LICENSE) 开源。欢迎 Star、Fork 与提交 PR！

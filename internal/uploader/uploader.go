@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cnzhwei/wopan-cli/internal/client"
+	"github.com/cnzhwei/pan-relay/internal/client"
 	"github.com/xhofe/wopan-sdk-go"
 )
 
