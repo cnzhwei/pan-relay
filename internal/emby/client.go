@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cnzhwei/pan-relay/internal/stream"
+	xproxy "golang.org/x/net/proxy"
 )
 
 const (
@@ -36,6 +38,7 @@ type Config struct {
 	DeviceID    string `json:"device_id,omitempty"`
 	Service     string `json:"service,omitempty"`
 	ItemLookup  string `json:"item_lookup,omitempty"`
+	Proxy       string `json:"proxy,omitempty"`
 	VerifyTLS   *bool  `json:"verify_tls,omitempty"`
 	HTTPTimeout int    `json:"http_timeout_seconds,omitempty"`
 }
@@ -87,6 +90,9 @@ func LoadConfig(customPath string) (Config, error) {
 	if value := os.Getenv("EMBY_ITEM_LOOKUP"); value != "" {
 		cfg.ItemLookup = value
 	}
+	if value := os.Getenv("EMBY_PROXY"); value != "" {
+		cfg.Proxy = value
+	}
 	if cfg.BaseURL == "" || cfg.Username == "" || cfg.Password == "" {
 		return Config{}, fmt.Errorf("Emby config requires base_url, username, and password")
 	}
@@ -98,6 +104,7 @@ type ConfigOverrides struct {
 	Client    string
 	Device    string
 	Version   string
+	Proxy     string
 }
 
 func (c Config) normalized(overrides ConfigOverrides) (Config, error) {
@@ -112,6 +119,9 @@ func (c Config) normalized(overrides ConfigOverrides) (Config, error) {
 	}
 	if overrides.Version != "" {
 		c.Version = overrides.Version
+	}
+	if overrides.Proxy != "" {
+		c.Proxy = overrides.Proxy
 	}
 	if c.Client == "" {
 		c.Client = DefaultClient
@@ -159,6 +169,81 @@ type Client struct {
 	userID      string
 }
 
+func normalizeProxyURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "direct") || strings.EqualFold(raw, "off") {
+		return "", nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", fmt.Errorf("invalid proxy URL")
+	}
+	scheme := strings.ToLower(u.Scheme)
+	switch scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return "", fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
+	}
+	return raw, nil
+}
+
+func newHTTPTransport(proxyRaw string) (*http.Transport, error) {
+	proxyURL, err := normalizeProxyURL(proxyRaw)
+	if err != nil {
+		return nil, err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if proxyURL == "" {
+		return transport, nil
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse proxy URL: %w", err)
+	}
+	if u.Scheme == "http" || u.Scheme == "https" {
+		transport.Proxy = http.ProxyURL(u)
+		return transport, nil
+	}
+
+	var auth *xproxy.Auth
+	if password, ok := u.User.Password(); ok {
+		auth = &xproxy.Auth{User: u.User.Username(), Password: password}
+	} else if u.User != nil {
+		auth = &xproxy.Auth{User: u.User.Username()}
+	}
+	dialer, err := xproxy.SOCKS5("tcp", u.Host, auth, xproxy.Direct)
+	if err != nil {
+		return nil, fmt.Errorf("configure SOCKS5 proxy: %w", err)
+	}
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		result := make(chan struct {
+			conn net.Conn
+			err  error
+		}, 1)
+		go func() {
+			conn, err := dialer.Dial(network, address)
+			result <- struct {
+				conn net.Conn
+				err  error
+			}{conn: conn, err: err}
+		}()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case result := <-result:
+			return result.conn, result.err
+		}
+	}
+	return transport, nil
+}
+
 func NewClient(cfg Config, overrides ConfigOverrides) (*Client, error) {
 	cfg, err := cfg.normalized(overrides)
 	if err != nil {
@@ -167,7 +252,11 @@ func NewClient(cfg Config, overrides ConfigOverrides) (*Client, error) {
 	if _, err := url.ParseRequestURI(cfg.BaseURL); err != nil {
 		return nil, fmt.Errorf("invalid Emby base_url: %w", err)
 	}
-	return &Client{cfg: cfg, httpClient: &http.Client{Timeout: time.Duration(cfg.HTTPTimeout) * time.Second}}, nil
+	transport, err := newHTTPTransport(cfg.Proxy)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Emby proxy: %w", err)
+	}
+	return &Client{cfg: cfg, httpClient: &http.Client{Transport: transport, Timeout: time.Duration(cfg.HTTPTimeout) * time.Second}}, nil
 }
 
 func (c *Client) UserAgent() string  { return c.cfg.UserAgent }

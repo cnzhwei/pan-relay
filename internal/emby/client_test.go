@@ -335,3 +335,74 @@ func TestVembyConfigDefaultsToStandardDetailLookup(t *testing.T) {
 		t.Fatalf("auth paths = %#v, want standard path only", got)
 	}
 }
+
+func TestNormalizeProxyURLSupportsHTTPAndSOCKS(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "http", in: "http://127.0.0.1:7890", want: "http://127.0.0.1:7890"},
+		{name: "https", in: "https://proxy.example:8443", want: "https://proxy.example:8443"},
+		{name: "socks5", in: "socks5://127.0.0.1:7891", want: "socks5://127.0.0.1:7891"},
+		{name: "socks5h", in: "socks5h://127.0.0.1:7891", want: "socks5h://127.0.0.1:7891"},
+		{name: "implicit http", in: "127.0.0.1:7890", want: "http://127.0.0.1:7890"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizeProxyURL(tt.in)
+			if err != nil || got != tt.want {
+				t.Fatalf("normalizeProxyURL(%q) = %q, %v; want %q", tt.in, got, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewClientRoutesHTTPRequestsThroughConfiguredProxy(t *testing.T) {
+	var sawAbsoluteURL bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawAbsoluteURL = r.URL.IsAbs()
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/Users/AuthenticateByName") {
+			t.Fatalf("proxy received %s %s", r.Method, r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"AccessToken":"token","User":{"Id":"user-1"}}`)
+	}))
+	defer proxy.Close()
+
+	c, err := NewClient(Config{
+		BaseURL:  proxy.URL + "/target",
+		Username: "u",
+		Password: "p",
+		Proxy:    proxy.URL,
+	}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login() through proxy error = %v", err)
+	}
+	if !sawAbsoluteURL {
+		t.Fatal("HTTP proxy did not receive absolute-form request")
+	}
+}
+
+func TestNewClientAcceptsSOCKSProxyConfiguration(t *testing.T) {
+	c, err := NewClient(Config{
+		BaseURL: "https://example.invalid",
+		Proxy:   "socks5h://127.0.0.1:7891",
+	}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() SOCKS config error = %v", err)
+	}
+	transport, ok := c.httpClient.Transport.(*http.Transport)
+	if !ok || transport.DialContext == nil {
+		t.Fatalf("SOCKS proxy did not install a custom DialContext: %#v", c.httpClient.Transport)
+	}
+}
+
+func TestNewClientRejectsUnsupportedProxyScheme(t *testing.T) {
+	if _, err := NewClient(Config{BaseURL: "https://example.invalid", Proxy: "ftp://127.0.0.1:21"}, ConfigOverrides{}); err == nil || !strings.Contains(err.Error(), "unsupported proxy scheme") {
+		t.Fatalf("NewClient() error = %v, want unsupported proxy scheme", err)
+	}
+}

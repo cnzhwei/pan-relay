@@ -73,6 +73,7 @@ Usage:
   --emby-client <name>          覆盖 X-Emby-Authorization Client
   --emby-device <name>          覆盖 X-Emby-Authorization Device
   --emby-version <version>      覆盖 X-Emby-Authorization Version
+  --emby-proxy <url>            Emby 源端代理（http[s]:// 或 socks5[s]h://）
   -t, --threads <num>           并发线程数 (默认: 4)
   version                       显示当前程序版本
 `, Version)
@@ -92,6 +93,7 @@ func main() {
 	var embyClient string
 	var embyDevice string
 	var embyVersion string
+	var embyProxy string
 	var threads int
 	var streamRelay bool
 
@@ -105,6 +107,7 @@ func main() {
 	flags.StringVar(&embyClient, "emby-client", "", "Emby authorization client")
 	flags.StringVar(&embyDevice, "emby-device", "", "Emby authorization device")
 	flags.StringVar(&embyVersion, "emby-version", "", "Emby authorization version")
+	flags.StringVar(&embyProxy, "emby-proxy", "", "Emby source proxy (http[s]:// or socks5[s]h://)")
 	flags.IntVar(&threads, "t", 4, "Concurrency threads")
 	flags.IntVar(&threads, "threads", 4, "Concurrency threads")
 	flags.BoolVar(&streamRelay, "stream", false, "Zero-disk memory streaming relay")
@@ -119,7 +122,7 @@ func main() {
 				printUsage()
 				return
 			}
-			if (arg == "-c" || arg == "--config" || arg == "--quark-config" || arg == "--baidu-config" || arg == "--emby-config" || arg == "--emby-ua" || arg == "--emby-client" || arg == "--emby-device" || arg == "--emby-version" || arg == "-t" || arg == "--threads") && i+1 < len(os.Args) {
+			if (arg == "-c" || arg == "--config" || arg == "--quark-config" || arg == "--baidu-config" || arg == "--emby-config" || arg == "--emby-ua" || arg == "--emby-client" || arg == "--emby-device" || arg == "--emby-version" || arg == "--emby-proxy" || arg == "-t" || arg == "--threads") && i+1 < len(os.Args) {
 				_ = flags.Parse([]string{arg, os.Args[i+1]})
 				i++
 				continue
@@ -151,7 +154,7 @@ func main() {
 
 	switch cmd {
 	case "relay":
-		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, embyConfigPath, emby.ConfigOverrides{UserAgent: embyUA, Client: embyClient, Device: embyDevice, Version: embyVersion}, threads, streamRelay, args)
+		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, embyConfigPath, emby.ConfigOverrides{UserAgent: embyUA, Client: embyClient, Device: embyDevice, Version: embyVersion, Proxy: embyProxy}, threads, streamRelay, args)
 	case "quark":
 		handleQuarkCommand(ctx, quarkConfigPath, threads, args)
 	case "baidu":

@@ -57,7 +57,8 @@ Emby 查询支持：
   "device": "Windows",
   "version": "1.3.0",
   "user_agent": "Hills Lite/1.3.0",
-  "item_lookup": "detail"
+  "item_lookup": "detail",
+  "proxy": "socks5h://127.0.0.1:7891"
 }
 ```
 
@@ -66,7 +67,15 @@ Emby 查询支持：
 - `guai`：默认兼容策略，优先使用 `Ids + Fields` 查询，并保留 `/emby` 认证路径回退；
 - `vemby`：标准详情查询 `/Users/{user}/Items/{id}`，认证使用 `/Users/AuthenticateByName`。
 
-也可以使用环境变量覆盖：`EMBY_SERVICE`、`EMBY_ITEM_LOOKUP`。Vemby 的官方 `Items/{id}/Download` 可能返回 403，pan-relay 不依赖该接口，而是使用带认证的 `Videos/{id}/stream` Range 直通流。
+也可以使用环境变量覆盖：`EMBY_SERVICE`、`EMBY_ITEM_LOOKUP`、`EMBY_PROXY`。`proxy` 支持：
+
+- `http://host:port`：HTTP 代理，HTTPS 目标通过 CONNECT；
+- `https://host:port`：HTTPS 代理；
+- `socks5://host:port`：SOCKS5；
+- `socks5h://host:port`：SOCKS5，并由代理端解析目标域名；
+- `host:port`：默认按 HTTP 代理处理。
+
+代理只作用于 Emby 源端的登录、查询、PlaybackInfo 和视频 Range 请求；WoPan 上传仍使用独立直连客户端。代理 URL 如果含用户名/密码，只保存在本地配置中，不要提交 Git 或打印日志。Vemby 的官方 `Items/{id}/Download` 可能返回 403，pan-relay 不依赖该接口，而是使用带认证的 `Videos/{id}/stream` Range 直通流。
 
 ## 凭据隔离
 
