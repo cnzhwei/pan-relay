@@ -18,12 +18,13 @@ import (
 	"github.com/cnzhwei/pan-relay/internal/client"
 	"github.com/cnzhwei/pan-relay/internal/config"
 	"github.com/cnzhwei/pan-relay/internal/downloader"
+	"github.com/cnzhwei/pan-relay/internal/emby"
 	"github.com/cnzhwei/pan-relay/internal/quark"
 	"github.com/cnzhwei/pan-relay/internal/stream"
 	"github.com/cnzhwei/pan-relay/internal/uploader"
 )
 
-var Version = "2.1.2"
+var Version = "2.2.0"
 
 const maxConcurrency = 32
 
@@ -67,6 +68,11 @@ Usage:
   -c, --config <path>           指定 WoPan 配置文件路径 (默认自动查找 ./wopan_config.json)
   --quark-config <path>         指定 Quark 配置文件路径 (默认自动查找 ./quark_config.json)
   --baidu-config <path>         指定 Baidu 配置文件路径 (默认自动查找 ./baidu_config.json)
+  --emby-config <path>          指定 Emby 配置文件路径 (默认 ~/.config/pan-relay/emby.json)
+  --emby-ua <ua>                覆盖 Emby HTTP User-Agent
+  --emby-client <name>          覆盖 X-Emby-Authorization Client
+  --emby-device <name>          覆盖 X-Emby-Authorization Device
+  --emby-version <version>      覆盖 X-Emby-Authorization Version
   -t, --threads <num>           并发线程数 (默认: 4)
   version                       显示当前程序版本
 `, Version)
@@ -81,6 +87,11 @@ func main() {
 	var configPath string
 	var quarkConfigPath string
 	var baiduConfigPath string
+	var embyConfigPath string
+	var embyUA string
+	var embyClient string
+	var embyDevice string
+	var embyVersion string
 	var threads int
 	var streamRelay bool
 
@@ -89,6 +100,11 @@ func main() {
 	flags.StringVar(&configPath, "config", "", "WoPan config path")
 	flags.StringVar(&quarkConfigPath, "quark-config", "", "Quark config path")
 	flags.StringVar(&baiduConfigPath, "baidu-config", "", "Baidu config path")
+	flags.StringVar(&embyConfigPath, "emby-config", "", "Emby config path")
+	flags.StringVar(&embyUA, "emby-ua", "", "Emby HTTP User-Agent")
+	flags.StringVar(&embyClient, "emby-client", "", "Emby authorization client")
+	flags.StringVar(&embyDevice, "emby-device", "", "Emby authorization device")
+	flags.StringVar(&embyVersion, "emby-version", "", "Emby authorization version")
 	flags.IntVar(&threads, "t", 4, "Concurrency threads")
 	flags.IntVar(&threads, "threads", 4, "Concurrency threads")
 	flags.BoolVar(&streamRelay, "stream", false, "Zero-disk memory streaming relay")
@@ -103,7 +119,7 @@ func main() {
 				printUsage()
 				return
 			}
-			if (arg == "-c" || arg == "--config" || arg == "--quark-config" || arg == "--baidu-config" || arg == "-t" || arg == "--threads") && i+1 < len(os.Args) {
+			if (arg == "-c" || arg == "--config" || arg == "--quark-config" || arg == "--baidu-config" || arg == "--emby-config" || arg == "--emby-ua" || arg == "--emby-client" || arg == "--emby-device" || arg == "--emby-version" || arg == "-t" || arg == "--threads") && i+1 < len(os.Args) {
 				_ = flags.Parse([]string{arg, os.Args[i+1]})
 				i++
 				continue
@@ -135,7 +151,7 @@ func main() {
 
 	switch cmd {
 	case "relay":
-		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, threads, streamRelay, args)
+		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, embyConfigPath, emby.ConfigOverrides{UserAgent: embyUA, Client: embyClient, Device: embyDevice, Version: embyVersion}, threads, streamRelay, args)
 	case "quark":
 		handleQuarkCommand(ctx, quarkConfigPath, threads, args)
 	case "baidu":
@@ -156,7 +172,7 @@ func main() {
 // Relay Implementation
 // -----------------------------------------------------------------------------
 
-func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConfig string, threads int, streamRelay bool, args []string) {
+func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, embyConfig string, embyOverrides emby.ConfigOverrides, threads int, streamRelay bool, args []string) {
 	if len(args) < 2 {
 		fmt.Println("Usage: pan-relay relay <source:path> <destination:path> [--stream] [-t 4]")
 		fmt.Println("Example: pan-relay relay quark:/来自：分享/电影.mkv wopan:/emby/movies/ --stream -t 6")
@@ -183,7 +199,7 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 	fileName := filepath.Base(srcPath)
 
 	if streamRelay {
-		executeStreamRelay(ctx, wopanConfig, quarkConfig, baiduConfig, srcCloud, srcPath, dstCloud, dstPath, threads)
+		executeStreamRelay(ctx, wopanConfig, quarkConfig, baiduConfig, embyConfig, embyOverrides, srcCloud, srcPath, dstCloud, dstPath, threads)
 		return
 	}
 
@@ -308,7 +324,7 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 	fmt.Println("\n[✓] Relay completed! Local temporary staging file deleted automatically.")
 }
 
-func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, srcCloud, srcPath, dstCloud, dstPath string, threads int) {
+func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, embyConfig string, embyOverrides emby.ConfigOverrides, srcCloud, srcPath, dstCloud, dstPath string, threads int) {
 	if dstCloud != "wopan" {
 		fmt.Fprintf(os.Stderr, "Unsupported destination cloud for stream relay: %s (supported: wopan)\n", dstCloud)
 		os.Exit(1)
@@ -355,6 +371,46 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 	var getPartReader uploader.PartReaderFunc
 
 	switch srcCloud {
+	case "emby":
+		eCfg, err := emby.LoadConfig(embyConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Emby Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		eClient, err := emby.NewClient(eCfg, embyOverrides)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Emby Client Error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := eClient.Login(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Emby Login Error: %v\n", err)
+			os.Exit(1)
+		}
+		items, err := eClient.Resolve(ctx, srcPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Emby Search Error: %v\n", err)
+			os.Exit(1)
+		}
+		if len(items) == 0 {
+			fmt.Fprintf(os.Stderr, "Emby query %q returned no items\n", srcPath)
+			os.Exit(1)
+		}
+		if len(items) > 1 {
+			fmt.Fprintf(os.Stderr, "Emby query %q returned %d items; use IMDb, TMDB, or item:<id> for an exact match\n", srcPath, len(items))
+			os.Exit(1)
+		}
+		item := items[0]
+		info, err := eClient.GetMediaInfo(ctx, item.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Emby PlaybackInfo Error: %v\n", err)
+			os.Exit(1)
+		}
+		fileName = eClient.FileName(item, info)
+		fileSize = info.Size
+		getPartReader = func(ctx context.Context, offset int64, size int64) (io.Reader, error) {
+			return eClient.PartReader(ctx, item.ID, info.SourceID, offset, size)
+		}
+
 	case "quark":
 		qCfg, err := quark.LoadConfig(quarkConfig)
 		if err != nil {

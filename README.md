@@ -50,6 +50,7 @@
   - **模式二（开放平台 OAuth）**：支持官方 `access_token` 与 `refresh_token` 标准鉴权；
   - 支持多线程并发下载大文件；
 - **📊 实时终端速度看板**：传输过程中平滑输出完成百分比、已完成/总大小、平均传输速率（MB/s）及耗时统计。
+- **🎬 Emby 源端流式中转**：支持片名、IMDb、TMDB、ItemId 查询；认证请求和媒体 Range 请求均支持独立配置 User-Agent 与客户端身份。
 
 ---
 
@@ -137,6 +138,9 @@ sha256sum --check SHA256SUMS.txt --ignore-missing
 - `-c, --config <path>`：指定 WoPan 配置文件；
 - `--quark-config <path>`：指定 Quark 配置文件；
 - `--baidu-config <path>`：指定 Baidu 配置文件；
+- `--emby-config <path>`：指定 Emby 配置文件；
+- `--emby-ua <ua>`：覆盖 Emby HTTP `User-Agent`；
+- `--emby-client <name>` / `--emby-device <name>` / `--emby-version <version>`：覆盖 Emby 身份字段；
 - `-t, --threads <num>`：并发线程数（默认 4，推荐 4~8）；
 - `-h, --help`：查看帮助；
 - `version`：查看当前版本。
@@ -157,6 +161,12 @@ pan-relay relay quark:/来自：分享/山海情/EP01.mkv wopan:/emby/tv/山海�
 
 # 3. 支持通过夸克 FID 直接中转
 pan-relay relay quark:56c288c923b74cc88f2ffcc08292310c wopan:/emby/movies/ --stream -t 4
+
+# Emby → WoPan 零磁盘中转：支持片名、IMDb、TMDB、ItemId
+pan-relay relay emby:tt1234567 wopan:/emby/movies/ --stream -t 4
+pan-relay relay emby:tmdb:12345 wopan:/emby/movies/ --stream --emby-ua 'SenPlayer/5.5.0'
+pan-relay relay emby:item:YOUR_ITEM_ID wopan:/emby/movies/ --stream \
+  --emby-client 'Hills Lite' --emby-device Android --emby-version 1.3.0
 ```
 
 *中转过程输出效果：*

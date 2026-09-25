@@ -1,7 +1,7 @@
 # pan-relay 修复 Checklist
 
 > 建立时间：2026-09-25
-> 范围：`v2.1.2`（基于提交 `457cb13` 继续修复发布版本显示）代码与发布元数据
+> 范围：`v2.2.0`（Emby 源端零磁盘中转与 UA 可配置集成）代码与发布元数据
 > 原则：先写回归测试，再修复；只把有实际工具输出证明的项目标记为完成。
 
 ## 修复项
@@ -71,10 +71,15 @@
   - 问题：标签 `v2.1.1` 原样写入 `main.Version` 后，CLI 再添加 `v`，导致发布二进制显示 `vv2.1.1`。
   - 验收：CI 去除标签前缀后注入版本；正式 Release 二进制显示单一 `v2.1.2`。
 
+- [x] **P1｜集成 Emby 源端零磁盘中转与可配置 UA**
+  - 文件：`internal/emby/`、`main.go`、`README.md`、`docs/emby-integration.md`
+  - 范围：Emby 登录、片名/IMDb/TMDB/ItemId 查询、PlaybackInfo、严格 Range 分片读取，并接入现有 WoPan `UploadStream`。
+  - 验收：支持 `emby:<query> ... --stream`；HTTP `User-Agent` 与 `X-Emby-Authorization` 的 Client/Device/Version 可分别由配置、环境变量或 CLI 覆盖；多结果查询拒绝自动选错条目。
+
 ## 运行环境备注
 
 - Lightvela 当前仍运行 `pan-relay v2.0.0`，本 checklist 不直接替换生产二进制。
-- 代码修复、测试和发布构建验证完成后，另行安排停机/切换窗口部署 `v2.1.0+`。
+- v2.2.0 仅发布源码和 Release，不自动部署到生产节点。
 
 ## 完成规则
 
