@@ -89,14 +89,14 @@ func Load(customPath string) (*Config, error) {
 
 func (c *Config) Save() error {
 	if c.filePath == "" {
-		// If no file was read, try saving to ~/.config/wopan-cli/config.json
+		// If no file was read, save to the current project's config directory.
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return nil
 		}
-		dir := filepath.Join(home, ".config", "wopan-cli")
+		dir := filepath.Join(home, ".config", "pan-relay")
 		_ = os.MkdirAll(dir, 0700)
-		c.filePath = filepath.Join(dir, "config.json")
+		c.filePath = filepath.Join(dir, "wopan.json")
 	}
 
 	data, err := json.MarshalIndent(c, "", "  ")

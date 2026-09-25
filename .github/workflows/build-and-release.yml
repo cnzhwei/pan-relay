@@ -82,13 +82,20 @@ jobs:
           for dir in */; do
             target="${dir%/}"
             if [[ "$target" == *".exe"* ]]; then
-              zip "../dist/${target}.zip" "${target}/${target}"
+              cp "${target}/${target}" ../dist/pan-relay.exe
+              (cd ../dist && zip "${target}.zip" pan-relay.exe)
+              rm ../dist/pan-relay.exe
             else
-              tar -czf "../dist/${target}.tar.gz" -C "${target}" "${target}"
+              cp "${target}/${target}" ../dist/pan-relay
+              tar -czf "../dist/${target}.tar.gz" -C ../dist pan-relay
+              rm ../dist/pan-relay
             fi
           done
           cd ..
           ls -lh dist/
+
+      - name: Generate SHA-256 checksums
+        run: (cd dist && sha256sum *.tar.gz *.zip) > dist/SHA256SUMS.txt
 
       - name: Publish Release
         uses: softprops/action-gh-release@v2

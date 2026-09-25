@@ -86,7 +86,7 @@ func (c *Config) Save() error {
 		if err != nil {
 			return nil
 		}
-		dir := filepath.Join(home, ".config", "wopan-cli")
+		dir := filepath.Join(home, ".config", "pan-relay")
 		_ = os.MkdirAll(dir, 0700)
 		c.filePath = filepath.Join(dir, "quark.json")
 	}
@@ -142,13 +142,13 @@ type SortResp struct {
 	} `json:"metadata"`
 	Data struct {
 		List []struct {
-			Fid        string `json:"fid"`
-			FileName   string `json:"file_name"`
-			Size       int64  `json:"size"`
-			FileType   int    `json:"file_type"`
-			Category   int    `json:"category"`
-			CreatedAt  int64  `json:"created_at"`
-			UpdatedAt  int64  `json:"updated_at"`
+			Fid       string `json:"fid"`
+			FileName  string `json:"file_name"`
+			Size      int64  `json:"size"`
+			FileType  int    `json:"file_type"`
+			Category  int    `json:"category"`
+			CreatedAt int64  `json:"created_at"`
+			UpdatedAt int64  `json:"updated_at"`
 		} `json:"list"`
 	} `json:"data"`
 }
@@ -163,6 +163,13 @@ type DownResp struct {
 		Size        int64  `json:"size"`
 		DownloadURL string `json:"download_url"`
 	} `json:"data"`
+}
+
+type DownloadInfo struct {
+	URL      string
+	Headers  http.Header
+	FileName string
+	Size     int64
 }
 
 func (c *Client) request(pathname string, method string, query map[string]string, body interface{}, result interface{}) error {
@@ -329,21 +336,29 @@ func (c *Client) ResolvePath(pathStr string) (string, error) {
 }
 
 func (c *Client) GetDownloadLink(fileID string) (string, http.Header, error) {
+	info, err := c.GetDownloadInfo(fileID)
+	if err != nil {
+		return "", nil, err
+	}
+	return info.URL, info.Headers, nil
+}
+
+func (c *Client) GetDownloadInfo(fileID string) (*DownloadInfo, error) {
 	body := map[string]interface{}{
 		"fids": []string{fileID},
 	}
 	var resp DownResp
 	err := c.request("/file/download", http.MethodPost, nil, body, &resp)
 	if err != nil {
-		return "", nil, err
+		return nil, err
 	}
 
 	if resp.Code != 0 {
-		return "", nil, fmt.Errorf("quark download error %d: %s", resp.Code, resp.Message)
+		return nil, fmt.Errorf("quark download error %d: %s", resp.Code, resp.Message)
 	}
 
 	if len(resp.Data) == 0 || resp.Data[0].DownloadURL == "" {
-		return "", nil, errors.New("no download URL returned from Quark API")
+		return nil, errors.New("no download URL returned from Quark API")
 	}
 
 	header := make(http.Header)
@@ -351,7 +366,12 @@ func (c *Client) GetDownloadLink(fileID string) (string, http.Header, error) {
 	header.Set("Referer", DefaultReferer)
 	header.Set("Cookie", c.cfg.Cookie)
 
-	return resp.Data[0].DownloadURL, header, nil
+	return &DownloadInfo{
+		URL:      resp.Data[0].DownloadURL,
+		Headers:  header,
+		FileName: resp.Data[0].FileName,
+		Size:     resp.Data[0].Size,
+	}, nil
 }
 
 func (c *Client) Config() *Config {

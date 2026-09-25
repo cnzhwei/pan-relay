@@ -74,6 +74,21 @@ func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID
 
 // UploadStream uploads directly from a stream/memory provider to WoPan without local disk storage
 func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSize int64, targetDirID string, getPartReader PartReaderFunc, opt UploadOptions) (string, error) {
+	if ctx == nil {
+		return "", fmt.Errorf("context is nil")
+	}
+	if c == nil {
+		return "", fmt.Errorf("WoPan client is nil")
+	}
+	if fileName == "" {
+		return "", fmt.Errorf("file name is empty")
+	}
+	if fileSize <= 0 {
+		return "", fmt.Errorf("file size must be positive: %d", fileSize)
+	}
+	if getPartReader == nil {
+		return "", fmt.Errorf("part reader provider is nil")
+	}
 	if opt.Concurrency <= 0 {
 		opt.Concurrency = 4
 	}
@@ -86,6 +101,8 @@ func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSi
 	}
 
 	rawClient := c.Raw()
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	zoneURL := "https://tjupload.pan.wo.cn"
 	if rawClient.ZoneURL != "" {
 		zoneURL = rawClient.ZoneURL
@@ -187,7 +204,7 @@ func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSi
 
 			for task := range tasksChan {
 				select {
-				case <-ctx.Done():
+				case <-uploadCtx.Done():
 					return
 				default:
 				}
@@ -196,12 +213,12 @@ func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSi
 				var partErr error
 				for attempt := 0; attempt <= opt.Retries; attempt++ {
 					select {
-					case <-ctx.Done():
+					case <-uploadCtx.Done():
 						return
 					default:
 					}
 
-					partReader, rErr := getPartReader(ctx, task.Offset, task.PartSize)
+					partReader, rErr := getPartReader(uploadCtx, task.Offset, task.PartSize)
 					if rErr != nil {
 						partErr = fmt.Errorf("failed to obtain part reader: %w", rErr)
 						time.Sleep(time.Duration(attempt+1) * time.Second)
@@ -224,6 +241,7 @@ func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSi
 					}
 
 					req := rawClient.NewRequest().
+						SetContext(uploadCtx).
 						SetResult(&resp).
 						ForceContentType("application/json;charset=UTF-8").
 						SetHeaders(map[string]string{
@@ -263,6 +281,7 @@ func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSi
 				}
 
 				if partErr != nil {
+					cancel()
 					select {
 					case errChan <- fmt.Errorf("part %d failed after retries: %w", task.PartIndex, partErr):
 					default:
@@ -275,6 +294,9 @@ func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSi
 
 	wg.Wait()
 	close(doneTicker)
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	select {
 	case err := <-errChan:

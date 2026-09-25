@@ -40,6 +40,7 @@ case "$OS" in
 esac
 
 TARGET_TAR="pan-relay-${OS_NAME}-${ARCH_NAME}.tar.gz"
+CHECKSUMS_URL="https://github.com/${REPO}/releases/latest/download/SHA256SUMS.txt"
 
 printf "    检测到系统: %s, 架构: %s\n" "$OS_NAME" "$ARCH_NAME"
 printf "\033[1;36m==> 获取最新发布版本信息...\033[0m\n"
@@ -61,6 +62,27 @@ printf "    下载地址: %s\n" "$DOWNLOAD_URL"
 printf "\033[1;36m==> 正在下载发布包...\033[0m\n"
 
 curl -sSL --retry 2 --connect-timeout 10 --max-time 60 "$DOWNLOAD_URL" -o "${TMP_DIR}/${TARGET_TAR}"
+if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 30 "$CHECKSUMS_URL" -o "${TMP_DIR}/SHA256SUMS.txt"; then
+    printf "\033[0;31m[!] 发布校验文件不存在或无法下载，拒绝安装未校验的二进制\033[0m\n" >&2
+    exit 1
+fi
+EXPECTED_SHA="$(awk -v target="$TARGET_TAR" '$2 == target {print $1}' "${TMP_DIR}/SHA256SUMS.txt")"
+if [ -z "$EXPECTED_SHA" ]; then
+    printf "\033[0;31m[!] 校验文件中没有当前平台的发布包\033[0m\n" >&2
+    exit 1
+fi
+if command -v sha256sum >/dev/null 2>&1; then
+    ACTUAL_SHA="$(sha256sum "${TMP_DIR}/${TARGET_TAR}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+    ACTUAL_SHA="$(shasum -a 256 "${TMP_DIR}/${TARGET_TAR}" | awk '{print $1}')"
+else
+    printf "\033[0;31m[!] 系统缺少 sha256sum 或 shasum，无法校验发布包\033[0m\n" >&2
+    exit 1
+fi
+if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+    printf "\033[0;31m[!] 发布包 SHA-256 校验失败\033[0m\n" >&2
+    exit 1
+fi
 tar -xzf "${TMP_DIR}/${TARGET_TAR}" -C "$TMP_DIR"
 
 if [ ! -f "${TMP_DIR}/pan-relay" ]; then

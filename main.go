@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -9,8 +8,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cnzhwei/pan-relay/internal/baidu"
@@ -18,10 +19,13 @@ import (
 	"github.com/cnzhwei/pan-relay/internal/config"
 	"github.com/cnzhwei/pan-relay/internal/downloader"
 	"github.com/cnzhwei/pan-relay/internal/quark"
+	"github.com/cnzhwei/pan-relay/internal/stream"
 	"github.com/cnzhwei/pan-relay/internal/uploader"
 )
 
 var Version = "2.1.0"
+
+const maxConcurrency = 32
 
 func printUsage() {
 	fmt.Printf(`pan-relay (全能多网盘轻量多线程中转工具) v%s
@@ -121,8 +125,13 @@ func main() {
 		fmt.Printf("pan-relay v%s\n", Version)
 		return
 	}
+	if threads < 1 || threads > maxConcurrency {
+		fmt.Fprintf(os.Stderr, "invalid concurrency %d: must be between 1 and %d\n", threads, maxConcurrency)
+		os.Exit(1)
+	}
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	switch cmd {
 	case "relay":
@@ -222,11 +231,15 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 				os.Exit(1)
 			}
 		}
-		dlURL, headers, err := qClient.GetDownloadLink(fid)
+		info, err := qClient.GetDownloadInfo(fid)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to get Quark download URL: %v\n", err)
 			os.Exit(1)
 		}
+		if info.FileName != "" {
+			fileName = info.FileName
+		}
+		dlURL, headers := info.URL, info.Headers
 		dlOpt := quark.DownloadOptions{Concurrency: threads, Retries: 3, ShowProgress: true}
 		if err := quark.Download(ctx, dlURL, headers, tmpFile, dlOpt); err != nil {
 			os.Exit(1)
@@ -380,11 +393,16 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			}
 		}
 
-		dlURL, headers, err := qClient.GetDownloadLink(fid)
+		info, err := qClient.GetDownloadInfo(fid)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to get Quark download URL: %v\n", err)
 			os.Exit(1)
 		}
+		if info.FileName != "" {
+			fileName = info.FileName
+		}
+		dlURL, headers := info.URL, info.Headers
+		fileSize = info.Size
 
 		if fileSize <= 0 {
 			headReq, _ := http.NewRequestWithContext(ctx, "HEAD", dlURL, nil)
@@ -395,8 +413,8 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			}
 			hResp, hErr := httpClient.Do(headReq)
 			if hErr == nil {
-				defer hResp.Body.Close()
 				fileSize = hResp.ContentLength
+				_ = hResp.Body.Close()
 			}
 		}
 
@@ -423,16 +441,7 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			}
 			defer resp.Body.Close()
 
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-				return nil, fmt.Errorf("quark stream server returned HTTP %d", resp.StatusCode)
-			}
-
-			buf := make([]byte, size)
-			_, err = io.ReadFull(resp.Body, buf)
-			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				return nil, fmt.Errorf("failed reading chunk from quark: %w", err)
-			}
-			return bytes.NewReader(buf), nil
+			return stream.ReadRangeResponse(resp, offset, size)
 		}
 
 	case "baidu":
@@ -458,8 +467,8 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 		}
 		hResp, hErr := httpClient.Do(headReq)
 		if hErr == nil {
-			defer hResp.Body.Close()
 			fileSize = hResp.ContentLength
+			_ = hResp.Body.Close()
 		}
 
 		if fileSize <= 0 {
@@ -472,12 +481,12 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			rangeReq.Header.Set("Range", "bytes=0-0")
 			rResp, rErr := httpClient.Do(rangeReq)
 			if rErr == nil {
-				defer rResp.Body.Close()
 				cr := rResp.Header.Get("Content-Range")
 				var start, end, total int64
 				if _, err := fmt.Sscanf(cr, "bytes %d-%d/%d", &start, &end, &total); err == nil && total > 0 {
 					fileSize = total
 				}
+				_ = rResp.Body.Close()
 			}
 		}
 
@@ -504,16 +513,7 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			}
 			defer resp.Body.Close()
 
-			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-				return nil, fmt.Errorf("baidu stream server returned HTTP %d", resp.StatusCode)
-			}
-
-			buf := make([]byte, size)
-			_, err = io.ReadFull(resp.Body, buf)
-			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				return nil, fmt.Errorf("failed reading chunk from baidu: %w", err)
-			}
-			return bytes.NewReader(buf), nil
+			return stream.ReadRangeResponse(resp, offset, size)
 		}
 
 	default:

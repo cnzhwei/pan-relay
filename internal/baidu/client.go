@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	DefaultWebUA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-	DefaultCrackUA     = "netdisk;P2SP;2.2.60.26"
-	DefaultAppUA       = "pan.baidu.com"
-	BaiduWebBaseURL    = "https://pan.baidu.com"
+	DefaultWebUA        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	DefaultCrackUA      = "netdisk;P2SP;2.2.60.26"
+	DefaultAppUA        = "pan.baidu.com"
+	BaiduWebBaseURL     = "https://pan.baidu.com"
 	BaiduOpenAPIBaseURL = "https://pan.baidu.com/rest/2.0"
 )
 
@@ -133,6 +133,14 @@ func NewClient(cfg *Config) *Client {
 		cfg:    cfg,
 		client: r,
 	}
+}
+
+func encodePathList(path string) (string, error) {
+	b, err := json.Marshal([]string{path})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 type FileItem struct {
@@ -364,7 +372,10 @@ func (c *Client) GetDownloadLink(targetPath string) (string, http.Header, error)
 	// 1. Try Cookie Crack API
 	if strings.Contains(c.cfg.Cookie, "BDUSS") || len(c.cfg.Cookie) > 20 {
 		url := BaiduWebBaseURL + "/api/filemetas"
-		targetJSON := fmt.Sprintf("[\"%s\"]", targetPath)
+		targetJSON, err := encodePathList(targetPath)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to encode Baidu path: %w", err)
+		}
 		var resp struct {
 			Errno int `json:"errno"`
 			Info  []struct {
@@ -388,7 +399,7 @@ func (c *Client) GetDownloadLink(targetPath string) (string, http.Header, error)
 				"origin": "dlna",
 			})
 
-		_, err := req.SetResult(&resp).Get(url)
+		_, err = req.SetResult(&resp).Get(url)
 		if err == nil && resp.Errno == 0 && len(resp.Info) > 0 && resp.Info[0].Dlink != "" {
 			h := make(http.Header)
 			h.Set("User-Agent", DefaultCrackUA)
@@ -514,7 +525,10 @@ func (c *Client) Delete(targetPath string) error {
 		targetPath = "/" + targetPath
 	}
 
-	fileListJSON := fmt.Sprintf("[\"%s\"]", targetPath)
+	fileListJSON, err := encodePathList(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to encode Baidu path: %w", err)
+	}
 
 	if c.cfg.AccessToken != "" {
 		url := BaiduOpenAPIBaseURL + "/xpan/file?method=filemanager&opera=delete"
