@@ -295,3 +295,43 @@ func TestNewClientRejectsNilContextAtRequestBoundary(t *testing.T) {
 		t.Fatalf("request(nil) error = %v", err)
 	}
 }
+
+func TestVembyServiceUsesStandardItemDetailAndAuthPath(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/Users/AuthenticateByName":
+			io.WriteString(w, `{"AccessToken":"token","User":{"Id":"user-1"}}`)
+		case "/Users/user-1/Items/item-1":
+			io.WriteString(w, `{"Id":"item-1","Type":"Movie","Name":"Movie"}`)
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c, err := NewClient(Config{BaseURL: server.URL, Username: "u", Password: "p", Service: "vemby"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if err := c.Login(context.Background()); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	items, err := c.Resolve(context.Background(), "item:item-1")
+	if err != nil || len(items) != 1 || items[0].ID != "item-1" {
+		t.Fatalf("Resolve() = %#v, %v", items, err)
+	}
+}
+
+func TestVembyConfigDefaultsToStandardDetailLookup(t *testing.T) {
+	c, err := NewClient(Config{BaseURL: "http://127.0.0.1", Service: "vemby"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	if c.cfg.ItemLookup != "detail" {
+		t.Fatalf("ItemLookup = %q, want detail", c.cfg.ItemLookup)
+	}
+	if got := c.authPaths(); len(got) != 1 || got[0] != "/Users/AuthenticateByName" {
+		t.Fatalf("auth paths = %#v, want standard path only", got)
+	}
+}

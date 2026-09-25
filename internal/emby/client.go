@@ -34,6 +34,8 @@ type Config struct {
 	Version     string `json:"version,omitempty"`
 	UserAgent   string `json:"user_agent,omitempty"`
 	DeviceID    string `json:"device_id,omitempty"`
+	Service     string `json:"service,omitempty"`
+	ItemLookup  string `json:"item_lookup,omitempty"`
 	VerifyTLS   *bool  `json:"verify_tls,omitempty"`
 	HTTPTimeout int    `json:"http_timeout_seconds,omitempty"`
 }
@@ -79,6 +81,12 @@ func LoadConfig(customPath string) (Config, error) {
 	if value := os.Getenv("EMBY_USER_AGENT"); value != "" {
 		cfg.UserAgent = value
 	}
+	if value := os.Getenv("EMBY_SERVICE"); value != "" {
+		cfg.Service = value
+	}
+	if value := os.Getenv("EMBY_ITEM_LOOKUP"); value != "" {
+		cfg.ItemLookup = value
+	}
 	if cfg.BaseURL == "" || cfg.Username == "" || cfg.Password == "" {
 		return Config{}, fmt.Errorf("Emby config requires base_url, username, and password")
 	}
@@ -92,7 +100,7 @@ type ConfigOverrides struct {
 	Version   string
 }
 
-func (c Config) normalized(overrides ConfigOverrides) Config {
+func (c Config) normalized(overrides ConfigOverrides) (Config, error) {
 	if overrides.UserAgent != "" {
 		c.UserAgent = overrides.UserAgent
 	}
@@ -120,10 +128,28 @@ func (c Config) normalized(overrides ConfigOverrides) Config {
 	if c.DeviceID == "" {
 		c.DeviceID = "pan-relay-emby"
 	}
+	c.Service = strings.ToLower(strings.TrimSpace(c.Service))
+	if c.Service == "" {
+		c.Service = "guai"
+	}
+	if c.Service != "guai" && c.Service != "vemby" {
+		return Config{}, fmt.Errorf("unsupported Emby service %q", c.Service)
+	}
+	c.ItemLookup = strings.ToLower(strings.TrimSpace(c.ItemLookup))
+	if c.ItemLookup == "" {
+		if c.Service == "vemby" {
+			c.ItemLookup = "detail"
+		} else {
+			c.ItemLookup = "ids_query"
+		}
+	}
+	if c.ItemLookup != "detail" && c.ItemLookup != "ids_query" {
+		return Config{}, fmt.Errorf("unsupported Emby item_lookup %q", c.ItemLookup)
+	}
 	if c.HTTPTimeout <= 0 {
 		c.HTTPTimeout = 60
 	}
-	return c
+	return c, nil
 }
 
 type Client struct {
@@ -134,7 +160,10 @@ type Client struct {
 }
 
 func NewClient(cfg Config, overrides ConfigOverrides) (*Client, error) {
-	cfg = cfg.normalized(overrides)
+	cfg, err := cfg.normalized(overrides)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := url.ParseRequestURI(cfg.BaseURL); err != nil {
 		return nil, fmt.Errorf("invalid Emby base_url: %w", err)
 	}
@@ -227,11 +256,26 @@ func isUnsupportedItemsQueryError(err error) bool {
 	return errors.As(err, &httpErr) && (httpErr.status == http.StatusNotFound || httpErr.status == http.StatusMethodNotAllowed || httpErr.status == http.StatusBadRequest)
 }
 
+func (c *Client) authPaths() []string {
+	if c.cfg.Service == "vemby" {
+		return []string{"/Users/AuthenticateByName"}
+	}
+	return []string{"/Users/AuthenticateByName", "/emby/Users/AuthenticateByName"}
+}
+
 func (c *Client) Login(ctx context.Context) error {
 	payload, _ := json.Marshal(map[string]string{"Username": c.cfg.Username, "Pw": c.cfg.Password})
-	resp, err := c.request(ctx, http.MethodPost, "/Users/AuthenticateByName", strings.NewReader(string(payload)), "application/json", false, nil)
-	if err != nil {
-		return fmt.Errorf("Emby login request: %w", err)
+	var resp *http.Response
+	var err error
+	for _, authPath := range c.authPaths() {
+		resp, err = c.request(ctx, http.MethodPost, authPath, strings.NewReader(string(payload)), "application/json", false, nil)
+		if err != nil {
+			return fmt.Errorf("Emby login request: %w", err)
+		}
+		if resp.StatusCode != http.StatusNotFound || authPath == c.authPaths()[len(c.authPaths())-1] {
+			break
+		}
+		_ = resp.Body.Close()
 	}
 	data, err := ensureJSON(resp, "login")
 	if err != nil {
@@ -333,6 +377,31 @@ func (c *Client) search(ctx context.Context, term, provider string) ([]Item, err
 
 func (c *Client) item(ctx context.Context, id string) (Item, error) {
 	fields := "Path,MediaSources,MediaStreams,Overview,ProductionYear,RunTimeTicks,Container,Size,CanDownload,SeriesName,SeasonName,IndexNumber,ParentIndexNumber,ProviderIds,OfficialRating,CommunityRating,DateCreated,PremiereDate,SeriesId,SeasonId,SortName,OriginalTitle"
+	if c.cfg.ItemLookup == "detail" {
+		resp, err := c.request(ctx, http.MethodGet, "/Users/"+url.PathEscape(c.userID)+"/Items/"+url.PathEscape(id)+"?Fields="+url.QueryEscape(fields), nil, "", true, nil)
+		if err != nil {
+			return Item{}, err
+		}
+		data, err := ensureJSON(resp, "item lookup")
+		if err != nil {
+			return Item{}, err
+		}
+		var result Item
+		if err := json.Unmarshal(data, &result); err != nil {
+			return Item{}, fmt.Errorf("parse Emby item lookup response: %w", err)
+		}
+		if result.ID == "" {
+			return Item{}, fmt.Errorf("Emby item %q response has missing ID", id)
+		}
+		if result.ID != id {
+			return Item{}, fmt.Errorf("Emby item lookup returned ID %q for requested ID %q", result.ID, id)
+		}
+		if !isPlayableItemType(result.Type) {
+			return Item{}, fmt.Errorf("Emby item %q has non-playable type %q", id, result.Type)
+		}
+		return result, nil
+	}
+
 	params := url.Values{"Ids": {id}, "Fields": {fields}}
 	resp, err := c.request(ctx, http.MethodGet, "/Users/"+url.PathEscape(c.userID)+"/Items?"+params.Encode(), nil, "", true, nil)
 	if err == nil {

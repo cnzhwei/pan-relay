@@ -43,6 +43,31 @@ Emby 查询支持：
 
 如果片名返回多个结果，程序会拒绝自动选择，需改用 IMDb、TMDB 或 ItemId 精确指定。
 
+## 服务端适配策略
+
+`service` 只描述服务端协议差异，客户端身份仍由 `client`、`device`、`version` 和 User-Agent 独立控制。
+
+```json
+{
+  "base_url": "https://sw.vemby01.de:443",
+  "username": "your_username",
+  "password": "your_password",
+  "service": "vemby",
+  "client": "Hills Lite",
+  "device": "Windows",
+  "version": "1.3.0",
+  "user_agent": "Hills Lite/1.3.0",
+  "item_lookup": "detail"
+}
+```
+
+内置策略：
+
+- `guai`：默认兼容策略，优先使用 `Ids + Fields` 查询，并保留 `/emby` 认证路径回退；
+- `vemby`：标准详情查询 `/Users/{user}/Items/{id}`，认证使用 `/Users/AuthenticateByName`。
+
+也可以使用环境变量覆盖：`EMBY_SERVICE`、`EMBY_ITEM_LOOKUP`。Vemby 的官方 `Items/{id}/Download` 可能返回 403，pan-relay 不依赖该接口，而是使用带认证的 `Videos/{id}/stream` Range 直通流。
+
 ## 凭据隔离
 
 默认配置路径：
