@@ -3,8 +3,10 @@ package emby
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -164,7 +166,10 @@ func (c *Client) endpoint(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	basePath := base.EscapedPath()
+	relPath := rel.EscapedPath()
 	base.Path = path.Join(base.Path, strings.TrimPrefix(rel.Path, "/"))
+	base.RawPath = path.Join(basePath, strings.TrimPrefix(relPath, "/"))
 	base.RawQuery = rel.RawQuery
 	return base.String(), nil
 }
@@ -202,9 +207,24 @@ func ensureJSON(resp *http.Response, what string) ([]byte, error) {
 		return nil, fmt.Errorf("read %s response: %w", what, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("Emby %s returned HTTP %d: %s", what, resp.StatusCode, strings.TrimSpace(string(data)))
+		return nil, embyHTTPError{what: what, status: resp.StatusCode, body: strings.TrimSpace(string(data))}
 	}
 	return data, nil
+}
+
+type embyHTTPError struct {
+	what   string
+	status int
+	body   string
+}
+
+func (e embyHTTPError) Error() string {
+	return fmt.Sprintf("Emby %s returned HTTP %d: %s", e.what, e.status, e.body)
+}
+
+func isUnsupportedItemsQueryError(err error) bool {
+	var httpErr embyHTTPError
+	return errors.As(err, &httpErr) && (httpErr.status == http.StatusNotFound || httpErr.status == http.StatusMethodNotAllowed || httpErr.status == http.StatusBadRequest)
 }
 
 func (c *Client) Login(ctx context.Context) error {
@@ -272,7 +292,11 @@ func (c *Client) Resolve(ctx context.Context, query string) ([]Item, error) {
 		return c.search(ctx, "", "tmdb."+match[1])
 	}
 	if strings.HasPrefix(strings.ToLower(query), "item:") {
-		item, err := c.item(ctx, strings.TrimSpace(query[5:]))
+		itemID := strings.TrimSpace(query[5:])
+		if itemID == "" {
+			return nil, fmt.Errorf("Emby item ID is empty")
+		}
+		item, err := c.item(ctx, itemID)
 		if err != nil {
 			return nil, err
 		}
@@ -289,7 +313,7 @@ func (c *Client) search(ctx context.Context, term, provider string) ([]Item, err
 	if provider != "" {
 		params.Set("AnyProviderIdEquals", provider)
 	}
-	endpoint := "/Users/" + c.userID + "/Items?" + params.Encode()
+	endpoint := "/Users/" + url.PathEscape(c.userID) + "/Items?" + params.Encode()
 	resp, err := c.request(ctx, http.MethodGet, endpoint, nil, "", true, nil)
 	if err != nil {
 		return nil, err
@@ -308,7 +332,44 @@ func (c *Client) search(ctx context.Context, term, provider string) ([]Item, err
 }
 
 func (c *Client) item(ctx context.Context, id string) (Item, error) {
-	resp, err := c.request(ctx, http.MethodGet, "/Users/"+c.userID+"/Items/"+url.PathEscape(id), nil, "", true, nil)
+	fields := "Path,MediaSources,MediaStreams,Overview,ProductionYear,RunTimeTicks,Container,Size,CanDownload,SeriesName,SeasonName,IndexNumber,ParentIndexNumber,ProviderIds,OfficialRating,CommunityRating,DateCreated,PremiereDate,SeriesId,SeasonId,SortName,OriginalTitle"
+	params := url.Values{"Ids": {id}, "Fields": {fields}}
+	resp, err := c.request(ctx, http.MethodGet, "/Users/"+url.PathEscape(c.userID)+"/Items?"+params.Encode(), nil, "", true, nil)
+	if err == nil {
+		data, lookupErr := ensureJSON(resp, "item lookup")
+		if lookupErr != nil {
+			if !isUnsupportedItemsQueryError(lookupErr) {
+				return Item{}, lookupErr
+			}
+			err = lookupErr
+		} else {
+			var list struct {
+				Items []Item `json:"Items"`
+			}
+			if jsonErr := json.Unmarshal(data, &list); jsonErr != nil {
+				return Item{}, fmt.Errorf("parse Emby item lookup response: %w", jsonErr)
+			}
+			switch len(list.Items) {
+			case 1:
+				if list.Items[0].ID != id {
+					return Item{}, fmt.Errorf("Emby item lookup returned ID %q for requested ID %q", list.Items[0].ID, id)
+				}
+				if !isPlayableItemType(list.Items[0].Type) {
+					return Item{}, fmt.Errorf("Emby item %q has non-playable type %q", id, list.Items[0].Type)
+				}
+				return list.Items[0], nil
+			case 0:
+				return Item{}, fmt.Errorf("Emby item %q not found", id)
+			default:
+				return Item{}, fmt.Errorf("Emby item lookup for %q returned %d items", id, len(list.Items))
+			}
+		}
+	}
+	// 兼容明确不支持 Ids 查询的 Emby 版本；其他请求错误直接返回，避免掩盖根因。
+	if !isUnsupportedItemsQueryError(err) {
+		return Item{}, err
+	}
+	resp, err = c.request(ctx, http.MethodGet, "/Users/"+url.PathEscape(c.userID)+"/Items/"+url.PathEscape(id), nil, "", true, nil)
 	if err != nil {
 		return Item{}, err
 	}
@@ -320,7 +381,25 @@ func (c *Client) item(ctx context.Context, id string) (Item, error) {
 	if err := json.Unmarshal(data, &result); err != nil {
 		return Item{}, err
 	}
+	if result.ID == "" {
+		return Item{}, fmt.Errorf("Emby item %q response has missing ID", id)
+	}
+	if result.ID != id {
+		return Item{}, fmt.Errorf("Emby item lookup returned ID %q for requested ID %q", result.ID, id)
+	}
+	if !isPlayableItemType(result.Type) {
+		return Item{}, fmt.Errorf("Emby item %q has non-playable type %q", id, result.Type)
+	}
 	return result, nil
+}
+
+func isPlayableItemType(itemType string) bool {
+	switch strings.ToLower(strings.TrimSpace(itemType)) {
+	case "movie", "episode", "video":
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Client) GetMediaInfo(ctx context.Context, itemID string) (MediaInfo, error) {
@@ -342,16 +421,20 @@ func (c *Client) GetMediaInfo(ctx context.Context, itemID string) (MediaInfo, er
 	if err := json.Unmarshal(data, &result); err != nil {
 		return MediaInfo{}, err
 	}
-	if len(result.MediaSources) == 0 || result.MediaSources[0].Size <= 0 {
-		return MediaInfo{}, fmt.Errorf("Emby item %s has no usable media source", itemID)
+	for _, source := range result.MediaSources {
+		if source.ID != "" && source.Size > 0 {
+			return MediaInfo{SourceID: source.ID, Size: source.Size, Container: source.Container}, nil
+		}
 	}
-	source := result.MediaSources[0]
-	return MediaInfo{SourceID: source.ID, Size: source.Size, Container: source.Container}, nil
+	return MediaInfo{}, fmt.Errorf("Emby item %s has no usable media source", itemID)
 }
 
 func (c *Client) PartReader(ctx context.Context, itemID, sourceID string, offset, size int64) (io.Reader, error) {
 	if size <= 0 || offset < 0 {
 		return nil, fmt.Errorf("invalid Emby range offset=%d size=%d", offset, size)
+	}
+	if offset > math.MaxInt64-size {
+		return nil, fmt.Errorf("Emby range offset=%d size=%d overflows int64", offset, size)
 	}
 	endpoint := "/Videos/" + url.PathEscape(itemID) + "/stream?Static=true&MediaSourceId=" + url.QueryEscape(sourceID) + "&DeviceId=" + url.QueryEscape(c.cfg.DeviceID)
 	resp, err := c.request(ctx, http.MethodGet, endpoint, nil, "", true, http.Header{"Range": []string{fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)}})

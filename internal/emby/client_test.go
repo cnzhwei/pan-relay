@@ -3,8 +3,10 @@ package emby
 import (
 	"context"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -92,6 +94,195 @@ func TestResolveByIMDbAndStreamReader(t *testing.T) {
 	data, err := io.ReadAll(reader)
 	if err != nil || string(data) != "data" {
 		t.Fatalf("PartReader() = %q, %v", data, err)
+	}
+}
+
+func TestResolveItemUsesIdsQueryAndValidatesIdentity(t *testing.T) {
+	var fallbackCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/Users/user-1/Items":
+			if got := r.URL.Query().Get("Ids"); got != "item-1" {
+				t.Fatalf("Ids = %q, want item-1", got)
+			}
+			if r.URL.Query().Get("Fields") == "" {
+				t.Fatal("Fields query is empty")
+			}
+			io.WriteString(w, `{"Items":[{"Id":"item-1","Name":"Movie","Type":"Movie","MediaSources":[{"Id":"source-1","Size":4}]}]}`)
+		case "/Users/user-1/Items/item-1":
+			fallbackCalled = true
+			t.Fatal("unexpected fallback request")
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	c, err := NewClient(Config{BaseURL: server.URL, UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.userID = "user-1"
+	items, err := c.Resolve(context.Background(), "item:item-1")
+	if err != nil || len(items) != 1 || items[0].ID != "item-1" || fallbackCalled {
+		t.Fatalf("Resolve() = %#v, %v, fallback=%v", items, err, fallbackCalled)
+	}
+}
+
+func TestEndpointPreservesEscapedPathSegments(t *testing.T) {
+	c, err := NewClient(Config{BaseURL: "http://example.test/base", UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	endpoint, err := c.endpoint("/Users/a%2Fb/Items/item%2Fc")
+	if err != nil {
+		t.Fatalf("endpoint() error = %v", err)
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+	if got := parsed.EscapedPath(); got != "/base/Users/a%2Fb/Items/item%2Fc" {
+		t.Fatalf("EscapedPath() = %q, want encoded path", got)
+	}
+}
+
+func TestResolveItemFallbackOnlyForUnsupportedQuery(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		wantLookup bool
+	}{
+		{name: "bad request", status: http.StatusBadRequest, wantLookup: true},
+		{name: "server error", status: http.StatusInternalServerError, wantLookup: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lookupCalled := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/Users/user-1/Items":
+					w.WriteHeader(tt.status)
+					io.WriteString(w, `{}`)
+				case "/Users/user-1/Items/item-1":
+					lookupCalled = true
+					io.WriteString(w, `{"Id":"item-1","Type":"Movie"}`)
+				default:
+					t.Fatalf("unexpected path %s", r.URL.Path)
+				}
+			}))
+			defer server.Close()
+
+			c, err := NewClient(Config{BaseURL: server.URL, UserAgent: "UA"}, ConfigOverrides{})
+			if err != nil {
+				t.Fatalf("NewClient() error = %v", err)
+			}
+			c.userID = "user-1"
+			_, _ = c.Resolve(context.Background(), "item:item-1")
+			if lookupCalled != tt.wantLookup {
+				t.Fatalf("fallback called = %v, want %v", lookupCalled, tt.wantLookup)
+			}
+		})
+	}
+}
+
+func TestResolveItemFallbackRejectsEmptyID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/Users/user-1/Items" {
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{}`)
+			return
+		}
+		io.WriteString(w, `{"Id":"","Type":"Movie"}`)
+	}))
+	defer server.Close()
+	c, err := NewClient(Config{BaseURL: server.URL, UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.userID = "user-1"
+	_, err = c.Resolve(context.Background(), "item:item-1")
+	if err == nil || !strings.Contains(err.Error(), "missing ID") {
+		t.Fatalf("Resolve() error = %v, want missing ID error", err)
+	}
+}
+
+func TestResolveItemRejectsMismatchedID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"Items":[{"Id":"other-item","Type":"Movie"}]}`)
+	}))
+	defer server.Close()
+
+	c, err := NewClient(Config{BaseURL: server.URL, UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.userID = "user-1"
+	_, err = c.Resolve(context.Background(), "item:item-1")
+	if err == nil || !strings.Contains(err.Error(), "returned ID") {
+		t.Fatalf("Resolve() error = %v, want mismatched ID error", err)
+	}
+}
+
+func TestResolveRejectsEmptyItemID(t *testing.T) {
+	c, err := NewClient(Config{BaseURL: "http://127.0.0.1", UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	_, err = c.Resolve(context.Background(), "item: ")
+	if err == nil || !strings.Contains(err.Error(), "item ID is empty") {
+		t.Fatalf("Resolve() error = %v, want empty item ID error", err)
+	}
+}
+
+func TestResolveRejectsNonPlayableItemType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"Items":[{"Id":"item-1","Type":"Person"}]}`)
+	}))
+	defer server.Close()
+
+	c, err := NewClient(Config{BaseURL: server.URL, UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.userID = "user-1"
+	_, err = c.Resolve(context.Background(), "item:item-1")
+	if err == nil || !strings.Contains(err.Error(), "non-playable") {
+		t.Fatalf("Resolve() error = %v, want non-playable error", err)
+	}
+}
+
+func TestGetMediaInfoSelectsFirstUsableSource(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"MediaSources":[{"Id":"","Size":100},{"Id":"source-2","Size":200,"Container":"mkv"}]}`)
+	}))
+	defer server.Close()
+
+	c, err := NewClient(Config{BaseURL: server.URL, UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	c.userID = "user-1"
+	info, err := c.GetMediaInfo(context.Background(), "item-1")
+	if err != nil || info.SourceID != "source-2" || info.Size != 200 {
+		t.Fatalf("GetMediaInfo() = %#v, %v", info, err)
+	}
+}
+
+func TestPartReaderRejectsRangeOverflow(t *testing.T) {
+	c, err := NewClient(Config{BaseURL: "http://127.0.0.1", UserAgent: "UA"}, ConfigOverrides{})
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	_, err = c.PartReader(context.Background(), "item-1", "source-1", math.MaxInt64, 2)
+	if err == nil || !strings.Contains(err.Error(), "overflows") {
+		t.Fatalf("PartReader() error = %v, want overflow error", err)
 	}
 }
 
