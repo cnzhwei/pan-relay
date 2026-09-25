@@ -58,8 +58,8 @@
 - [x] **P2｜补充发布安装完整性说明**
   - 文件：`install.sh`、`README.md`
   - 问题：安装脚本下载发布包后没有 checksum/signature 校验。
-  - 当前进展：CI 生成 `SHA256SUMS.txt`，安装脚本拒绝无校验文件的 Release，README 增加手动校验命令。
-  - 验收：本地发布归档与 checksum 生成、校验流程已实测；线上 Release 资产回读仍需正式发布后验证。
+  - 当前进展：CI 生成 `SHA256SUMS.txt`，安装脚本拒绝无校验文件的 Release，README 增加手动校验命令；`v2.1.2` 已实际发布并回读资产验证。
+  - 验收：`v2.1.2` 含 4 个平台归档和 `SHA256SUMS.txt`；Linux amd64 下载包 SHA-256 校验通过，解压后显示 `pan-relay v2.1.2`。
 
 - [x] **P2｜修复发布归档内部文件名**
   - 文件：`.github/workflows/build-and-release.yml`
