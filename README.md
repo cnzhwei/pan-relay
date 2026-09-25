@@ -74,6 +74,15 @@ chmod +x pan-relay
 sudo mv pan-relay /usr/local/bin/
 ```
 
+每个正式 Release 同时提供 `SHA256SUMS.txt`。手动下载时请在安装前校验：
+
+```bash
+curl -fsSLO https://github.com/cnzhwei/pan-relay/releases/latest/download/SHA256SUMS.txt
+sha256sum --check SHA256SUMS.txt --ignore-missing
+```
+
+校验文件缺失、没有对应平台条目或校验失败时，不要运行该二进制；一键安装脚本会默认拒绝未提供校验文件的旧 Release。
+
 ---
 
 ## 🔐 凭据配置说明

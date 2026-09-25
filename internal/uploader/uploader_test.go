@@ -2,6 +2,7 @@ package uploader
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 )
@@ -30,5 +31,27 @@ func TestUploadStreamRejectsNilContext(t *testing.T) {
 		return nil, nil
 	}, UploadOptions{}); err == nil {
 		t.Fatal("expected nil context to be rejected")
+	}
+}
+
+func TestCleanupPartialUploadDeletesReturnedFID(t *testing.T) {
+	var deleted string
+	err := cleanupPartialUpload("partial-fid", func(fid string) error {
+		deleted = fid
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("cleanupPartialUpload() error = %v", err)
+	}
+	if deleted != "partial-fid" {
+		t.Fatalf("deleted fid = %q, want %q", deleted, "partial-fid")
+	}
+}
+
+func TestCleanupPartialUploadReportsDeleteFailure(t *testing.T) {
+	wantErr := io.ErrClosedPipe
+	err := cleanupPartialUpload("partial-fid", func(string) error { return wantErr })
+	if err == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("cleanupPartialUpload() error = %v, want wrapped %v", err, wantErr)
 	}
 }

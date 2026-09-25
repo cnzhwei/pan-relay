@@ -23,7 +23,7 @@ import (
 	"github.com/cnzhwei/pan-relay/internal/uploader"
 )
 
-var Version = "2.1.0"
+var Version = "2.1.1"
 
 const maxConcurrency = 32
 

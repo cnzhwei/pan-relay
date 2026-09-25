@@ -39,6 +39,18 @@ type PartTask struct {
 // PartReaderFunc supplies an io.Reader for the specified offset and size
 type PartReaderFunc func(ctx context.Context, offset int64, size int64) (io.Reader, error)
 
+type deleteRemoteFunc func(fid string) error
+
+func cleanupPartialUpload(fid string, deleteRemote deleteRemoteFunc) error {
+	if fid == "" {
+		return nil
+	}
+	if err := deleteRemote(fid); err != nil {
+		return fmt.Errorf("failed to clean up remote partial file %s: %w", fid, err)
+	}
+	return nil
+}
+
 // Upload uploads a local disk file to WoPan
 func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID string, opt UploadOptions) (string, error) {
 	if opt.Concurrency <= 0 {
@@ -295,11 +307,27 @@ func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSi
 	wg.Wait()
 	close(doneTicker)
 	if err := ctx.Err(); err != nil {
+		fidMu.Lock()
+		partialFid := finalFid
+		fidMu.Unlock()
+		if partialFid != "" {
+			if cleanupErr := cleanupPartialUpload(partialFid, c.Delete); cleanupErr != nil {
+				return "", fmt.Errorf("%w; %v", err, cleanupErr)
+			}
+		}
 		return "", err
 	}
 
 	select {
 	case err := <-errChan:
+		fidMu.Lock()
+		partialFid := finalFid
+		fidMu.Unlock()
+		if partialFid != "" {
+			if cleanupErr := cleanupPartialUpload(partialFid, c.Delete); cleanupErr != nil {
+				return "", fmt.Errorf("%w; %v", err, cleanupErr)
+			}
+		}
 		fmt.Printf("\n[!] Upload failed: %v\n", err)
 		return "", err
 	default:
