@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cnzhwei/pan-relay/internal/baidu"
 	"github.com/cnzhwei/pan-relay/internal/client"
@@ -16,7 +21,7 @@ import (
 	"github.com/cnzhwei/pan-relay/internal/uploader"
 )
 
-var Version = "2.0.0"
+var Version = "2.1.0"
 
 func printUsage() {
 	fmt.Printf(`pan-relay (全能多网盘轻量多线程中转工具) v%s
@@ -25,11 +30,12 @@ Usage:
   pan-relay [options] <command> [arguments]
 
 === 1. 跨网盘全自动中转流水线 (Relay) ===
-  relay <source> <destination>
-      从指定源网盘拉取文件并多线程推流至目标网盘，完成后自动销毁本地临时切片。
+  relay <source> <destination> [--stream]
+      从指定源网盘拉取文件并多线程推流至目标网盘。
+      支持 --stream 开启内存管道流式穿透（零磁盘占用、边下边传、突破 VPS 硬盘限制）。
       示例:
-        pan-relay relay quark:/来自：分享/电影.mkv wopan:/emby/movies/ -t 6
-        pan-relay relay baidu:/影视资源/电影.mkv wopan:/emby/movies/ -t 6
+        pan-relay relay quark:/来自：分享/电影.mkv wopan:/emby/movies/ --stream -t 6
+        pan-relay relay baidu:/影视资源/电影.mkv wopan:/emby/movies/ --stream -t 6
 
 === 2. 沃家云盘 (WoPan) 命令 ===
   wopan whoami                  显示当前登录账号信息与空间容量
@@ -72,6 +78,7 @@ func main() {
 	var quarkConfigPath string
 	var baiduConfigPath string
 	var threads int
+	var streamRelay bool
 
 	flags := flag.NewFlagSet("pan-relay", flag.ExitOnError)
 	flags.StringVar(&configPath, "c", "", "WoPan config path")
@@ -80,6 +87,7 @@ func main() {
 	flags.StringVar(&baiduConfigPath, "baidu-config", "", "Baidu config path")
 	flags.IntVar(&threads, "t", 4, "Concurrency threads")
 	flags.IntVar(&threads, "threads", 4, "Concurrency threads")
+	flags.BoolVar(&streamRelay, "stream", false, "Zero-disk memory streaming relay")
 
 	// Parse arguments preserving subcommands
 	var args []string
@@ -118,7 +126,7 @@ func main() {
 
 	switch cmd {
 	case "relay":
-		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, threads, args)
+		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, threads, streamRelay, args)
 	case "quark":
 		handleQuarkCommand(ctx, quarkConfigPath, threads, args)
 	case "baidu":
@@ -139,11 +147,11 @@ func main() {
 // Relay Implementation
 // -----------------------------------------------------------------------------
 
-func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConfig string, threads int, args []string) {
+func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConfig string, threads int, streamRelay bool, args []string) {
 	if len(args) < 2 {
-		fmt.Println("Usage: pan-relay relay <source:path> <destination:path> [-t 4]")
-		fmt.Println("Example: pan-relay relay quark:/来自：分享/电影.mkv wopan:/emby/movies/ -t 6")
-		fmt.Println("Example: pan-relay relay baidu:/我的资源/电影.mkv wopan:/emby/movies/ -t 6")
+		fmt.Println("Usage: pan-relay relay <source:path> <destination:path> [--stream] [-t 4]")
+		fmt.Println("Example: pan-relay relay quark:/来自：分享/电影.mkv wopan:/emby/movies/ --stream -t 6")
+		fmt.Println("Example: pan-relay relay baidu:/我的资源/电影.mkv wopan:/emby/movies/ --stream -t 6")
 		os.Exit(1)
 	}
 
@@ -164,6 +172,12 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 	dstPath := dstParts[1]
 
 	fileName := filepath.Base(srcPath)
+
+	if streamRelay {
+		executeStreamRelay(ctx, wopanConfig, quarkConfig, baiduConfig, srcCloud, srcPath, dstCloud, dstPath, threads)
+		return
+	}
+
 	fmt.Printf("[Relay Pipeline] Starting relay: %s [%s] -> %s [%s] (Threads: %d)\n",
 		strings.ToUpper(srcCloud), fileName, strings.ToUpper(dstCloud), dstPath, threads)
 
@@ -263,7 +277,12 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			fmt.Fprintf(os.Stderr, "Error resolving WoPan directory %q: %v\n", dstPath, err)
 			os.Exit(1)
 		}
-		upOpt := uploader.UploadOptions{Concurrency: threads, Retries: 3, ShowProgress: true}
+		upOpt := uploader.UploadOptions{
+			Concurrency:  threads,
+			Retries:      3,
+			ShowProgress: true,
+			RemoteName:   fileName,
+		}
 		if _, err := uploader.Upload(ctx, wClient, tmpFile, targetDirID, upOpt); err != nil {
 			os.Exit(1)
 		}
@@ -274,6 +293,251 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 	}
 
 	fmt.Println("\n[✓] Relay completed! Local temporary staging file deleted automatically.")
+}
+
+func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, srcCloud, srcPath, dstCloud, dstPath string, threads int) {
+	if dstCloud != "wopan" {
+		fmt.Fprintf(os.Stderr, "Unsupported destination cloud for stream relay: %s (supported: wopan)\n", dstCloud)
+		os.Exit(1)
+	}
+
+	wCfg, err := config.Load(wopanConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WoPan Config Error: %v\n", err)
+		os.Exit(1)
+	}
+	wClient, err := client.New(wCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WoPan Client Error: %v\n", err)
+		os.Exit(1)
+	}
+	if err := wClient.EnsureValidToken(); err != nil {
+		fmt.Fprintf(os.Stderr, "WoPan Token Error: %v\n", err)
+		os.Exit(1)
+	}
+	targetDirID, err := wClient.ResolvePath(dstPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving WoPan directory %q: %v\n", dstPath, err)
+		os.Exit(1)
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second,
+	}
+
+	var fileName string
+	var fileSize int64
+	var getPartReader uploader.PartReaderFunc
+
+	switch srcCloud {
+	case "quark":
+		qCfg, err := quark.LoadConfig(quarkConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Quark Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		qClient := quark.NewClient(qCfg)
+
+		fid := srcPath
+		fileName = filepath.Base(srcPath)
+
+		if strings.Contains(srcPath, "/") {
+			dirPath := filepath.Dir(srcPath)
+			dirFID, err := qClient.ResolvePath(dirPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error resolving Quark path %q: %v\n", dirPath, err)
+				os.Exit(1)
+			}
+			files, err := qClient.ListDir(dirFID)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			found := false
+			for _, f := range files {
+				if !f.IsFolder && f.Name == fileName {
+					fid = f.FID
+					fileSize = f.Size
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.Fprintf(os.Stderr, "File %q not found in Quark path %q\n", fileName, dirPath)
+				os.Exit(1)
+			}
+		}
+
+		dlURL, headers, err := qClient.GetDownloadLink(fid)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to get Quark download URL: %v\n", err)
+			os.Exit(1)
+		}
+
+		if fileSize <= 0 {
+			headReq, _ := http.NewRequestWithContext(ctx, "HEAD", dlURL, nil)
+			for k, v := range headers {
+				for _, val := range v {
+					headReq.Header.Add(k, val)
+				}
+			}
+			hResp, hErr := httpClient.Do(headReq)
+			if hErr == nil {
+				defer hResp.Body.Close()
+				fileSize = hResp.ContentLength
+			}
+		}
+
+		if fileSize <= 0 {
+			fmt.Fprintf(os.Stderr, "Error: unable to determine remote file size for %q\n", fileName)
+			os.Exit(1)
+		}
+
+		getPartReader = func(ctx context.Context, offset int64, size int64) (io.Reader, error) {
+			req, err := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range headers {
+				for _, val := range v {
+					req.Header.Add(k, val)
+				}
+			}
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+size-1))
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+				return nil, fmt.Errorf("quark stream server returned HTTP %d", resp.StatusCode)
+			}
+
+			buf := make([]byte, size)
+			_, err = io.ReadFull(resp.Body, buf)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				return nil, fmt.Errorf("failed reading chunk from quark: %w", err)
+			}
+			return bytes.NewReader(buf), nil
+		}
+
+	case "baidu":
+		bCfg, err := baidu.LoadConfig(baiduConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Baidu Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		bClient := baidu.NewClient(bCfg)
+
+		fileName = filepath.Base(srcPath)
+		dlURL, headers, err := bClient.GetDownloadLink(srcPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to get Baidu download URL: %v\n", err)
+			os.Exit(1)
+		}
+
+		headReq, _ := http.NewRequestWithContext(ctx, "HEAD", dlURL, nil)
+		for k, v := range headers {
+			for _, val := range v {
+				headReq.Header.Add(k, val)
+			}
+		}
+		hResp, hErr := httpClient.Do(headReq)
+		if hErr == nil {
+			defer hResp.Body.Close()
+			fileSize = hResp.ContentLength
+		}
+
+		if fileSize <= 0 {
+			rangeReq, _ := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+			for k, v := range headers {
+				for _, val := range v {
+					rangeReq.Header.Add(k, val)
+				}
+			}
+			rangeReq.Header.Set("Range", "bytes=0-0")
+			rResp, rErr := httpClient.Do(rangeReq)
+			if rErr == nil {
+				defer rResp.Body.Close()
+				cr := rResp.Header.Get("Content-Range")
+				var start, end, total int64
+				if _, err := fmt.Sscanf(cr, "bytes %d-%d/%d", &start, &end, &total); err == nil && total > 0 {
+					fileSize = total
+				}
+			}
+		}
+
+		if fileSize <= 0 {
+			fmt.Fprintf(os.Stderr, "Error: unable to determine Baidu remote file size for %q\n", fileName)
+			os.Exit(1)
+		}
+
+		getPartReader = func(ctx context.Context, offset int64, size int64) (io.Reader, error) {
+			req, err := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			for k, v := range headers {
+				for _, val := range v {
+					req.Header.Add(k, val)
+				}
+			}
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+size-1))
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+				return nil, fmt.Errorf("baidu stream server returned HTTP %d", resp.StatusCode)
+			}
+
+			buf := make([]byte, size)
+			_, err = io.ReadFull(resp.Body, buf)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				return nil, fmt.Errorf("failed reading chunk from baidu: %w", err)
+			}
+			return bytes.NewReader(buf), nil
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unsupported source cloud for stream relay: %s (supported: quark, baidu)\n", srcCloud)
+		os.Exit(1)
+	}
+
+	fmt.Printf("[Stream Relay] Direct memory pipe: %s [%s] (%.2f MB) -> WoPan [%s] (Zero Disk Footprint, Threads: %d)...\n",
+		strings.ToUpper(srcCloud), fileName, float64(fileSize)/(1024*1024), dstPath, threads)
+
+	upOpt := uploader.UploadOptions{
+		Concurrency:  threads,
+		Retries:      3,
+		ShowProgress: true,
+		RemoteName:   fileName,
+	}
+
+	fid, err := uploader.UploadStream(ctx, wClient, fileName, fileSize, targetDirID, getPartReader, upOpt)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Stream relay upload failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("[✓] Stream relay completed successfully: %s (FID: %s)\n", fileName, fid)
 }
 
 // -----------------------------------------------------------------------------

@@ -43,6 +43,8 @@ func LoadConfig(customPath string) (*Config, error) {
 
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates,
+			filepath.Join(home, ".config", "pan-relay", "quark.json"),
+			filepath.Join(home, ".config", "pan-relay", "config.json"),
 			filepath.Join(home, ".config", "wopan-cli", "quark.json"),
 			filepath.Join(home, ".quark_config.json"),
 		)

@@ -4,12 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	DownloadChunkSize = int64(10 * 1024 * 1024) // 10MB per task chunk
 )
 
 type DownloadOptions struct {
@@ -32,9 +37,24 @@ func Download(ctx context.Context, downloadURL string, customHeaders http.Header
 		opt.Retries = 3
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+	}
 
-	// 1. Probe HEAD or Range 0-0
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second, // 60s per chunk
+	}
+
+	// Probe HEAD or Range 0-0
 	req, err := http.NewRequestWithContext(ctx, "HEAD", downloadURL, nil)
 	if err != nil {
 		return fmt.Errorf("failed to create HEAD request: %w", err)
@@ -130,23 +150,24 @@ func Download(ctx context.Context, downloadURL string, customHeaders http.Header
 		return fmt.Errorf("failed to allocate file size: %w", err)
 	}
 
-	fmt.Printf("Downloading %s (%.2f MB) from Quark with %d threads...\n",
-		filepath.Base(outputPath), float64(fileSize)/(1024*1024), opt.Concurrency)
+	totalChunks := int((fileSize + DownloadChunkSize - 1) / DownloadChunkSize)
+	fmt.Printf("Downloading %s (%.2f MB, %d chunks) from Quark with %d threads...\n",
+		filepath.Base(outputPath), float64(fileSize)/(1024*1024), totalChunks, opt.Concurrency)
 
-	partSize := fileSize / int64(opt.Concurrency)
-	tasks := make([]ChunkTask, opt.Concurrency)
-	for i := 0; i < opt.Concurrency; i++ {
-		start := int64(i) * partSize
-		end := start + partSize - 1
-		if i == opt.Concurrency-1 {
+	tasksChan := make(chan ChunkTask, totalChunks)
+	for i := 0; i < totalChunks; i++ {
+		start := int64(i) * DownloadChunkSize
+		end := start + DownloadChunkSize - 1
+		if end >= fileSize {
 			end = fileSize - 1
 		}
-		tasks[i] = ChunkTask{
+		tasksChan <- ChunkTask{
 			Index: i,
 			Start: start,
 			End:   end,
 		}
 	}
+	close(tasksChan)
 
 	var completedBytes atomic.Int64
 	doneTicker := make(chan struct{})
@@ -176,80 +197,94 @@ func Download(ctx context.Context, downloadURL string, customHeaders http.Header
 
 	var wg sync.WaitGroup
 	errChan := make(chan error, opt.Concurrency)
+	workerCount := opt.Concurrency
+	if workerCount > totalChunks {
+		workerCount = totalChunks
+	}
 
-	for _, task := range tasks {
+	for w := 0; w < workerCount; w++ {
 		wg.Add(1)
-		go func(t ChunkTask) {
+		go func() {
 			defer wg.Done()
 
-			var chunkErr error
-			for attempt := 0; attempt <= opt.Retries; attempt++ {
+			buf := make([]byte, 64*1024)
+
+			for task := range tasksChan {
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
 
-				req, _ := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
-				for k, v := range customHeaders {
-					for _, val := range v {
-						req.Header.Add(k, val)
+				var chunkErr error
+				for attempt := 0; attempt <= opt.Retries; attempt++ {
+					select {
+					case <-ctx.Done():
+						return
+					default:
 					}
-				}
-				req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", t.Start, t.End))
 
-				resp, err := client.Do(req)
-				if err != nil {
-					chunkErr = err
-					time.Sleep(time.Duration(attempt+1) * time.Second)
-					continue
-				}
+					req, _ := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
+					for k, v := range customHeaders {
+						for _, val := range v {
+							req.Header.Add(k, val)
+						}
+					}
+					req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", task.Start, task.End))
 
-				if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-					resp.Body.Close()
-					chunkErr = fmt.Errorf("chunk %d HTTP %d", t.Index, resp.StatusCode)
-					time.Sleep(time.Duration(attempt+1) * time.Second)
-					continue
-				}
+					resp, err := client.Do(req)
+					if err != nil {
+						chunkErr = err
+						time.Sleep(time.Duration(attempt+1) * time.Second)
+						continue
+					}
 
-				buf := make([]byte, 64*1024)
-				currentOffset := t.Start
-				var readErr error
+					if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+						resp.Body.Close()
+						chunkErr = fmt.Errorf("chunk %d HTTP %d", task.Index, resp.StatusCode)
+						time.Sleep(time.Duration(attempt+1) * time.Second)
+						continue
+					}
 
-				for {
-					n, rErr := resp.Body.Read(buf)
-					if n > 0 {
-						if _, wErr := out.WriteAt(buf[:n], currentOffset); wErr != nil {
-							readErr = wErr
+					currentOffset := task.Start
+					var readErr error
+
+					for {
+						n, rErr := resp.Body.Read(buf)
+						if n > 0 {
+							if _, wErr := out.WriteAt(buf[:n], currentOffset); wErr != nil {
+								readErr = wErr
+								break
+							}
+							currentOffset += int64(n)
+							completedBytes.Add(int64(n))
+						}
+						if rErr != nil {
+							if rErr != io.EOF {
+								readErr = rErr
+							}
 							break
 						}
-						currentOffset += int64(n)
-						completedBytes.Add(int64(n))
 					}
-					if rErr != nil {
-						if rErr != io.EOF {
-							readErr = rErr
-						}
+					resp.Body.Close()
+
+					if readErr == nil && currentOffset >= task.End+1 {
+						chunkErr = nil
 						break
 					}
+					chunkErr = readErr
+					time.Sleep(time.Duration(attempt+1) * time.Second)
 				}
-				resp.Body.Close()
 
-				if readErr == nil && currentOffset >= t.End+1 {
-					chunkErr = nil
-					break
-				}
-				chunkErr = readErr
-				time.Sleep(time.Duration(attempt+1) * time.Second)
-			}
-
-			if chunkErr != nil {
-				select {
-				case errChan <- fmt.Errorf("chunk %d failed: %w", t.Index, chunkErr):
-				default:
+				if chunkErr != nil {
+					select {
+					case errChan <- fmt.Errorf("chunk %d (%d-%d) failed after retries: %w", task.Index, task.Start, task.End, chunkErr):
+					default:
+					}
+					return
 				}
 			}
-		}(task)
+		}()
 	}
 
 	wg.Wait()

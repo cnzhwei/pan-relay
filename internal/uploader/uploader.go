@@ -24,9 +24,10 @@ const (
 )
 
 type UploadOptions struct {
-	Concurrency int
-	Retries     int
+	Concurrency  int
+	Retries      int
 	ShowProgress bool
+	RemoteName   string
 }
 
 type PartTask struct {
@@ -35,6 +36,10 @@ type PartTask struct {
 	Offset    int64
 }
 
+// PartReaderFunc supplies an io.Reader for the specified offset and size
+type PartReaderFunc func(ctx context.Context, offset int64, size int64) (io.Reader, error)
+
+// Upload uploads a local disk file to WoPan
 func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID string, opt UploadOptions) (string, error) {
 	if opt.Concurrency <= 0 {
 		opt.Concurrency = 4
@@ -55,7 +60,26 @@ func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID
 	}
 
 	fileName := filepath.Base(localPath)
+	if opt.RemoteName != "" {
+		fileName = opt.RemoteName
+	}
 	fileSize := fi.Size()
+
+	getPartReader := func(ctx context.Context, offset int64, size int64) (io.Reader, error) {
+		return io.NewSectionReader(f, offset, size), nil
+	}
+
+	return UploadStream(ctx, c, fileName, fileSize, targetDirID, getPartReader, opt)
+}
+
+// UploadStream uploads directly from a stream/memory provider to WoPan without local disk storage
+func UploadStream(ctx context.Context, c *client.Client, fileName string, fileSize int64, targetDirID string, getPartReader PartReaderFunc, opt UploadOptions) (string, error) {
+	if opt.Concurrency <= 0 {
+		opt.Concurrency = 4
+	}
+	if opt.Retries <= 0 {
+		opt.Retries = 3
+	}
 
 	if targetDirID == "" {
 		targetDirID = "0"
@@ -161,17 +185,6 @@ func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID
 		go func() {
 			defer wg.Done()
 
-			// Each worker has its own read handle to avoid file seek races
-			workerFile, err := os.Open(localPath)
-			if err != nil {
-				select {
-				case errChan <- err:
-				default:
-				}
-				return
-			}
-			defer workerFile.Close()
-
 			for task := range tasksChan {
 				select {
 				case <-ctx.Done():
@@ -188,6 +201,13 @@ func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID
 					default:
 					}
 
+					partReader, rErr := getPartReader(ctx, task.Offset, task.PartSize)
+					if rErr != nil {
+						partErr = fmt.Errorf("failed to obtain part reader: %w", rErr)
+						time.Sleep(time.Duration(attempt+1) * time.Second)
+						continue
+					}
+
 					var resp wopan.Upload2CResp
 					formData := map[string]string{
 						"uniqueId":    uniqueID,
@@ -202,8 +222,6 @@ func Upload(ctx context.Context, c *client.Client, localPath string, targetDirID
 						"partSize":    strconv.FormatInt(task.PartSize, 10),
 						"partIndex":   strconv.FormatInt(task.PartIndex, 10),
 					}
-
-					partReader := io.NewSectionReader(workerFile, task.Offset, task.PartSize)
 
 					req := rawClient.NewRequest().
 						SetResult(&resp).

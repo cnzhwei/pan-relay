@@ -139,14 +139,15 @@ sudo mv pan-relay /usr/local/bin/
 在 VPS 上单行命令拉取源盘资源直推目标网盘，完成后自动销毁本地切片：
 
 ```bash
-# 1. 从夸克拉取电影中转到沃家云盘 /emby/movies/ 目录 (6线程并发)
+# 1. 【强烈推荐】开启 --stream 零磁盘流式穿透中转（边下边传、不占 VPS 硬盘、突破小鸡空间限制）
+pan-relay relay quark:/来自：分享/山海情/EP01.mkv wopan:/emby/tv/山海情/ --stream -t 6
+pan-relay relay baidu:/我的影视/奥本海默.2023.mkv wopan:/emby/movies/ --stream -t 6
+
+# 2. 传统落盘暂存中转模式（先完整下载至本地临时切片，再推流上传并自动清理）
 pan-relay relay quark:/来自：分享/山海情/EP01.mkv wopan:/emby/tv/山海情/ -t 6
 
-# 2. 从百度网盘中转到沃家云盘
-pan-relay relay baidu:/我的影视/奥本海默.2023.mkv wopan:/emby/movies/ -t 6
-
 # 3. 支持通过夸克 FID 直接中转
-pan-relay relay quark:56c288c923b74cc88f2ffcc08292310c wopan:/emby/movies/ -t 4
+pan-relay relay quark:56c288c923b74cc88f2ffcc08292310c wopan:/emby/movies/ --stream -t 4
 ```
 
 *中转过程输出效果：*

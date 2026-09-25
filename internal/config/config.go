@@ -32,6 +32,8 @@ func Load(customPath string) (*Config, error) {
 	// Home dir
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates,
+			filepath.Join(home, ".config", "pan-relay", "wopan.json"),
+			filepath.Join(home, ".config", "pan-relay", "config.json"),
 			filepath.Join(home, ".config", "wopan-cli", "config.json"),
 			filepath.Join(home, ".wopan_config.json"),
 		)
