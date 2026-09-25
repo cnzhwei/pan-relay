@@ -1,7 +1,7 @@
 # pan-relay 修复 Checklist
 
 > 建立时间：2026-09-25
-> 范围：`v2.1.1`（基于提交 `c5736d2` 继续加固）代码与发布元数据
+> 范围：`v2.1.2`（基于提交 `457cb13` 继续修复发布版本显示）代码与发布元数据
 > 原则：先写回归测试，再修复；只把有实际工具输出证明的项目标记为完成。
 
 ## 修复项
@@ -61,10 +61,15 @@
   - 当前进展：CI 生成 `SHA256SUMS.txt`，安装脚本拒绝无校验文件的 Release，README 增加手动校验命令。
   - 验收：本地发布归档与 checksum 生成、校验流程已实测；线上 Release 资产回读仍需正式发布后验证。
 
-- [x] **P1｜修复发布归档内部文件名**
+- [x] **P2｜修复发布归档内部文件名**
   - 文件：`.github/workflows/build-and-release.yml`
   - 问题：发布归档内部文件名为带平台后缀的构建名，`install.sh` 却只查找 `pan-relay`。
   - 验收：CI 打包时统一将 Linux/macOS 二进制归档为 `pan-relay`，Windows 归档为 `pan-relay.exe`。
+
+- [x] **P2｜修复 Release 二进制重复版本前缀**
+  - 文件：`.github/workflows/build-and-release.yml`
+  - 问题：标签 `v2.1.1` 原样写入 `main.Version` 后，CLI 再添加 `v`，导致发布二进制显示 `vv2.1.1`。
+  - 验收：CI 去除标签前缀后注入版本；正式 Release 二进制显示单一 `v2.1.2`。
 
 ## 运行环境备注
 

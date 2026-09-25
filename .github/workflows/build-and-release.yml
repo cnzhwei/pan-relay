@@ -50,6 +50,7 @@ jobs:
           OUTPUT_NAME="bin/${{ matrix.artifact_name }}"
           mkdir -p bin
           VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
           if [ -z "$VERSION" ] || [ "$VERSION" = "main" ]; then
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
