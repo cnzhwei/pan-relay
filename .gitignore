@@ -10,3 +10,4 @@ dist/
 !go.sum
 credentials.json
 .DS_Store
+build/

@@ -17,6 +17,7 @@ import (
 	"github.com/cnzhwei/pan-relay/internal/baidu"
 	"github.com/cnzhwei/pan-relay/internal/client"
 	"github.com/cnzhwei/pan-relay/internal/config"
+	"github.com/cnzhwei/pan-relay/internal/ctyun"
 	"github.com/cnzhwei/pan-relay/internal/downloader"
 	"github.com/cnzhwei/pan-relay/internal/emby"
 	"github.com/cnzhwei/pan-relay/internal/quark"
@@ -24,7 +25,7 @@ import (
 	"github.com/cnzhwei/pan-relay/internal/uploader"
 )
 
-var Version = "2.2.0"
+var Version = "2.3.0"
 
 const maxConcurrency = 32
 
@@ -64,10 +65,21 @@ Usage:
   baidu mkdir <parent> <name>   在百度网盘创建新目录
   baidu rm <path>               删除百度网盘指定文件或目录
 
+=== 5. 天翼云盘 (Tianyi Cloud / 189) 命令 ===
+  ctyun whoami                  显示账号、空间类型与容量
+  ctyun ls [path]               浏览天翼云盘目录 (默认根目录 /)
+  ctyun download <path> [dst]   下载文件到本地 (实测线路不同最优线程数不同，-t 1~8 可调)
+  ctyun upload <local> [dir]    分片上传本地文件到天翼云盘
+  ctyun mkdir <parent> <name>   创建目录
+  ctyun rm <path>               删除文件或目录
+  ctyun refresh                 刷新 access_token 并写回配置
+  (别名: 189 / tianyi)
+
 === 全局通用选项 ===
   -c, --config <path>           指定 WoPan 配置文件路径 (默认自动查找 ./wopan_config.json)
   --quark-config <path>         指定 Quark 配置文件路径 (默认自动查找 ./quark_config.json)
   --baidu-config <path>         指定 Baidu 配置文件路径 (默认自动查找 ./baidu_config.json)
+  --ctyun-config <path>         指定天翼云盘配置文件路径 (默认自动查找 ./ctyun_config.json)
   --emby-config <path>          指定 Emby 配置文件路径 (默认 ~/.config/pan-relay/emby.json)
   --emby-ua <ua>                覆盖 Emby HTTP User-Agent
   --emby-client <name>          覆盖 X-Emby-Authorization Client
@@ -88,6 +100,7 @@ func main() {
 	var configPath string
 	var quarkConfigPath string
 	var baiduConfigPath string
+	var ctyunConfigPath string
 	var embyConfigPath string
 	var embyUA string
 	var embyClient string
@@ -108,6 +121,7 @@ func main() {
 	flags.StringVar(&embyDevice, "emby-device", "", "Emby authorization device")
 	flags.StringVar(&embyVersion, "emby-version", "", "Emby authorization version")
 	flags.StringVar(&embyProxy, "emby-proxy", "", "Emby source proxy (http[s]:// or socks5[s]h://)")
+	flags.StringVar(&ctyunConfigPath, "ctyun-config", "", "Tianyi Cloud (189) config path")
 	flags.IntVar(&threads, "t", 4, "Concurrency threads")
 	flags.IntVar(&threads, "threads", 4, "Concurrency threads")
 	flags.BoolVar(&streamRelay, "stream", false, "Zero-disk memory streaming relay")
@@ -122,7 +136,7 @@ func main() {
 				printUsage()
 				return
 			}
-			if (arg == "-c" || arg == "--config" || arg == "--quark-config" || arg == "--baidu-config" || arg == "--emby-config" || arg == "--emby-ua" || arg == "--emby-client" || arg == "--emby-device" || arg == "--emby-version" || arg == "--emby-proxy" || arg == "-t" || arg == "--threads") && i+1 < len(os.Args) {
+			if (arg == "-c" || arg == "--config" || arg == "--quark-config" || arg == "--baidu-config" || arg == "--ctyun-config" || arg == "--emby-config" || arg == "--emby-ua" || arg == "--emby-client" || arg == "--emby-device" || arg == "--emby-version" || arg == "--emby-proxy" || arg == "-t" || arg == "--threads") && i+1 < len(os.Args) {
 				_ = flags.Parse([]string{arg, os.Args[i+1]})
 				i++
 				continue
@@ -154,11 +168,13 @@ func main() {
 
 	switch cmd {
 	case "relay":
-		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, embyConfigPath, emby.ConfigOverrides{UserAgent: embyUA, Client: embyClient, Device: embyDevice, Version: embyVersion, Proxy: embyProxy}, threads, streamRelay, args)
+		handleRelayCommand(ctx, configPath, quarkConfigPath, baiduConfigPath, ctyunConfigPath, embyConfigPath, emby.ConfigOverrides{UserAgent: embyUA, Client: embyClient, Device: embyDevice, Version: embyVersion, Proxy: embyProxy}, threads, streamRelay, args)
 	case "quark":
 		handleQuarkCommand(ctx, quarkConfigPath, threads, args)
 	case "baidu":
 		handleBaiduCommand(ctx, baiduConfigPath, threads, args)
+	case "ctyun", "189", "tianyi":
+		handleCTYunCommand(ctx, ctyunConfigPath, threads, args)
 	case "wopan":
 		if len(args) == 0 {
 			fmt.Println("Usage: pan-relay wopan <whoami|ls|upload|download|mkdir|rm|refresh> [args]")
@@ -175,7 +191,7 @@ func main() {
 // Relay Implementation
 // -----------------------------------------------------------------------------
 
-func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, embyConfig string, embyOverrides emby.ConfigOverrides, threads int, streamRelay bool, args []string) {
+func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, ctyunConfig, embyConfig string, embyOverrides emby.ConfigOverrides, threads int, streamRelay bool, args []string) {
 	if len(args) < 2 {
 		fmt.Println("Usage: pan-relay relay <source:path> <destination:path> [--stream] [-t 4]")
 		fmt.Println("Example: pan-relay relay quark:/来自：分享/电影.mkv wopan:/emby/movies/ --stream -t 6")
@@ -202,7 +218,7 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 	fileName := filepath.Base(srcPath)
 
 	if streamRelay {
-		executeStreamRelay(ctx, wopanConfig, quarkConfig, baiduConfig, embyConfig, embyOverrides, srcCloud, srcPath, dstCloud, dstPath, threads)
+		executeStreamRelay(ctx, wopanConfig, quarkConfig, baiduConfig, ctyunConfig, embyConfig, embyOverrides, srcCloud, srcPath, dstCloud, dstPath, threads)
 		return
 	}
 
@@ -281,8 +297,32 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			os.Exit(1)
 		}
 
+	case "ctyun", "189", "tianyi":
+		cCfg, err := ctyun.LoadConfig(ctyunConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		cClient := ctyun.NewClient(cCfg)
+		item, err := cClient.FindFile(ctx, srcPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi source error: %v\n", err)
+			os.Exit(1)
+		}
+		fileName = item.Name
+		dlURL, err := cClient.GetDownloadURL(ctx, item.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi download url error: %v\n", err)
+			os.Exit(1)
+		}
+		dlOpt := ctyun.DownloadOptions{Concurrency: threads, Retries: 3, ShowProgress: true}
+		if err := ctyun.Download(ctx, dlURL, nil, tmpFile, dlOpt); err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi download failed: %v\n", err)
+			os.Exit(1)
+		}
+
 	default:
-		fmt.Fprintf(os.Stderr, "Unsupported source cloud for relay: %s (supported: quark, baidu)\n", srcCloud)
+		fmt.Fprintf(os.Stderr, "Unsupported source cloud for relay: %s (supported: quark, baidu, ctyun)\n", srcCloud)
 		os.Exit(1)
 	}
 
@@ -319,38 +359,85 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			os.Exit(1)
 		}
 
+	case "ctyun", "189", "tianyi":
+		dCfg, err := ctyun.LoadConfig(ctyunConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		dClient := ctyun.NewClient(dCfg)
+		dirID, err := dClient.ResolveDir(ctx, dstPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving Tianyi directory %q: %v\n", dstPath, err)
+			os.Exit(1)
+		}
+		upOpt := ctyun.UploadOptions{
+			Concurrency:  threads,
+			Retries:      3,
+			ShowProgress: true,
+			RemoteName:   fileName,
+		}
+		if _, err := dClient.UploadLocal(ctx, dirID, tmpFile, upOpt); err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi upload failed: %v\n", err)
+			os.Exit(1)
+		}
+
 	default:
-		fmt.Fprintf(os.Stderr, "Unsupported destination cloud for relay: %s (supported: wopan)\n", dstCloud)
+		fmt.Fprintf(os.Stderr, "Unsupported destination cloud for relay: %s (supported: wopan, ctyun)\n", dstCloud)
 		os.Exit(1)
 	}
 
 	fmt.Println("\n[✓] Relay completed! Local temporary staging file deleted automatically.")
 }
 
-func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, embyConfig string, embyOverrides emby.ConfigOverrides, srcCloud, srcPath, dstCloud, dstPath string, threads int) {
-	if dstCloud != "wopan" {
-		fmt.Fprintf(os.Stderr, "Unsupported destination cloud for stream relay: %s (supported: wopan)\n", dstCloud)
+func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, ctyunConfig, embyConfig string, embyOverrides emby.ConfigOverrides, srcCloud, srcPath, dstCloud, dstPath string, threads int) {
+	if dstCloud != "wopan" && dstCloud != "ctyun" && dstCloud != "189" {
+		fmt.Fprintf(os.Stderr, "Unsupported destination cloud for stream relay: %s (supported: wopan, ctyun)\n", dstCloud)
 		os.Exit(1)
 	}
 
-	wCfg, err := config.Load(wopanConfig)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "WoPan Config Error: %v\n", err)
-		os.Exit(1)
-	}
-	wClient, err := client.New(wCfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "WoPan Client Error: %v\n", err)
-		os.Exit(1)
-	}
-	if err := wClient.EnsureValidToken(); err != nil {
-		fmt.Fprintf(os.Stderr, "WoPan Token Error: %v\n", err)
-		os.Exit(1)
-	}
-	targetDirID, err := wClient.ResolvePath(dstPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error resolving WoPan directory %q: %v\n", dstPath, err)
-		os.Exit(1)
+	var (
+		wClient     *client.Client
+		wCfg        *config.Config
+		cDstClient  *ctyun.Client
+		cDstCfg     *ctyun.Config
+		targetDirID string
+	)
+
+	if dstCloud == "wopan" {
+		var err error
+		wCfg, err = config.Load(wopanConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WoPan Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		wClient, err = client.New(wCfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WoPan Client Error: %v\n", err)
+			os.Exit(1)
+		}
+		if err := wClient.EnsureValidToken(); err != nil {
+			fmt.Fprintf(os.Stderr, "WoPan Token Error: %v\n", err)
+			os.Exit(1)
+		}
+		targetDirID, err = wClient.ResolvePath(dstPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving WoPan directory %q: %v\n", dstPath, err)
+			os.Exit(1)
+		}
+	} else {
+		var err error
+		cDstCfg, err = ctyun.LoadConfig(ctyunConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		cDstClient = ctyun.NewClient(cDstCfg)
+		targetDirID, err = cDstClient.ResolveDir(ctx, dstPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving Tianyi directory %q: %v\n", dstPath, err)
+			os.Exit(1)
+		}
 	}
 
 	transport := &http.Transport{
@@ -575,22 +662,67 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			return stream.ReadRangeResponse(resp, offset, size)
 		}
 
+	case "ctyun", "189", "tianyi":
+		cCfg, err := ctyun.LoadConfig(ctyunConfig)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi Config Error: %v\n", err)
+			os.Exit(1)
+		}
+		cClient := ctyun.NewClient(cCfg)
+		item, err := cClient.FindFile(ctx, srcPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi source error: %v\n", err)
+			os.Exit(1)
+		}
+		fileName = item.Name
+		fileSize = item.Size
+		dlURL, err := cClient.GetDownloadURL(ctx, item.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Tianyi download url error: %v\n", err)
+			os.Exit(1)
+		}
+		getPartReader = func(ctx context.Context, offset int64, size int64) (io.Reader, error) {
+			req, err := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+size-1))
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			return stream.ReadRangeResponse(resp, offset, size)
+		}
+
 	default:
-		fmt.Fprintf(os.Stderr, "Unsupported source cloud for stream relay: %s (supported: quark, baidu)\n", srcCloud)
+		fmt.Fprintf(os.Stderr, "Unsupported source cloud for stream relay: %s (supported: quark, baidu, ctyun)\n", srcCloud)
 		os.Exit(1)
 	}
 
-	fmt.Printf("[Stream Relay] Direct memory pipe: %s [%s] (%.2f MB) -> WoPan [%s] (Zero Disk Footprint, Threads: %d)...\n",
-		strings.ToUpper(srcCloud), fileName, float64(fileSize)/(1024*1024), dstPath, threads)
+	fmt.Printf("[Stream Relay] Direct memory pipe: %s [%s] (%.2f MB) -> %s [%s] (Zero Disk Footprint, Threads: %d)...\n",
+		strings.ToUpper(srcCloud), fileName, float64(fileSize)/(1024*1024), strings.ToUpper(dstCloud), dstPath, threads)
 
-	upOpt := uploader.UploadOptions{
-		Concurrency:  threads,
-		Retries:      3,
-		ShowProgress: true,
-		RemoteName:   fileName,
+	var fid string
+	var err error
+	if dstCloud == "wopan" {
+		upOpt := uploader.UploadOptions{
+			Concurrency:  threads,
+			Retries:      3,
+			ShowProgress: true,
+			RemoteName:   fileName,
+		}
+		fid, err = uploader.UploadStream(ctx, wClient, fileName, fileSize, targetDirID, getPartReader, upOpt)
+	} else {
+		upOpt := ctyun.UploadOptions{
+			Concurrency:  threads,
+			Retries:      3,
+			ShowProgress: true,
+			RemoteName:   fileName,
+		}
+		fid, err = cDstClient.UploadStream(ctx, targetDirID, fileName, fileSize, ctyun.PartReaderFunc(getPartReader), upOpt)
 	}
-
-	fid, err := uploader.UploadStream(ctx, wClient, fileName, fileSize, targetDirID, getPartReader, upOpt)
+	_ = cDstCfg
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Stream relay upload failed: %v\n", err)
 		os.Exit(1)

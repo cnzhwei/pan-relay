@@ -37,7 +37,7 @@
 
 - **🚀 纯静态绿色二进制**：Go 原生开发，`CGO_ENABLED=0` 静态编译。在 **Alpine Linux（musl / Busybox）**、**Debian / Ubuntu**、CentOS 及 macOS 上复制即用；
 - **🔄 一键全自动跨盘中转流水线 (`relay`)**：
-  - 支持 `quark -> wopan`、`baidu -> wopan` 单行命令调度；
+  - 支持 `quark/baidu/ctyun/emby -> wopan` 与 `quark/baidu/emby/wopan -> ctyun` 单行命令调度；
   - 自动完成“源网盘多线程高速拉取 -> 目标网盘多线程切片推流 -> 远端校验 -> 自动彻底删除本地临时缓存”全闭环；
 - **📦 沃家云盘 (WoPan) 核心**：
   - 基于联通底层 8MB 切片（`upload2C`）并发推流，跑满海外 VPS 往国内联通骨干网物理上行；
@@ -49,6 +49,11 @@
   - **模式一（Cookie / BDUSS）**：直接粘贴浏览器抓取的 Cookie 即可高速拉取，免去申请开发者 App 的繁琐认证；
   - **模式二（开放平台 OAuth）**：支持官方 `access_token` 与 `refresh_token` 标准鉴权；
   - 支持多线程并发下载大文件；
+- **☁️ 天翼云盘 (Tianyi Cloud / 189) 原生组件**：
+  - 复刻官方 PC 客户端协议：`refresh_token` → `access_token`（7 天，自动滚动刷新）→ `sessionKey/sessionSecret`，每个请求做 HMAC-SHA1 签名并对敏感参数做 AES-128-ECB 加密；
+  - 支持个人云与家庭云（`type: personal|family`），分片上传按官方规则自动选择 10/20/50+ MiB；
+  - 支持作为 `relay` 的**源端与目标端**，零磁盘流式中转已实测通过（MD5 一致）；
+  - 下载支持 Range 并发，线程数按线路自行调整（同网直连时单连接往往最快）；
 - **📊 实时终端速度看板**：传输过程中平滑输出完成百分比、已完成/总大小、平均传输速率（MB/s）及耗时统计。
 - **🎬 Emby 源端流式中转**：支持片名、IMDb、TMDB、ItemId 查询；认证请求和媒体 Range 请求均支持独立配置 User-Agent 与客户端身份。
 
@@ -130,6 +135,24 @@ sha256sum --check SHA256SUMS.txt --ignore-missing
   }
   ```
 
+### 4. 天翼云盘凭据 (`ctyun_config.json`)
+
+查找顺序：命令行 `--ctyun-config` > `./ctyun_config.json` > `~/.config/pan-relay/ctyun.json` > 环境变量 `CTYUN_REFRESH_TOKEN`。
+
+```json
+{
+  "refresh_token": "32位refresh_token",
+  "family_id": "家庭云ID（可选，登录后自动识别）",
+  "root_folder_id": "-11",
+  "type": "personal"
+}
+```
+
+- `type` 取 `personal`（个人云，默认）或 `family`（家庭云）；一个配置文件只能对应一种空间。
+- `access_token` 无需手填：首次运行会自动用 `refresh_token` 换取并写回，`refresh_token` 轮换后也会自动更新文件。
+- ⚠️ **`refresh_token` 是单点有效的**：每次刷新都会让上一枚 `access_token` 立即作废。**不要在两台机器上同时用同一份凭据**，否则会互相踢下线形成死锁。
+- 首次登录若提示"设备ID不存在，需要二次设备校验"，需在 OpenList 等客户端完成一次短信校验拿到 `DEVICEID`；或参考 OpenList v4.2.7+ 的 `sms_code` 流程。
+
 ---
 
 ## 🛠️ 详细命令手册
@@ -138,6 +161,7 @@ sha256sum --check SHA256SUMS.txt --ignore-missing
 - `-c, --config <path>`：指定 WoPan 配置文件；
 - `--quark-config <path>`：指定 Quark 配置文件；
 - `--baidu-config <path>`：指定 Baidu 配置文件；
+- `--ctyun-config <path>`：指定天翼云盘配置文件；
 - `--emby-config <path>`：指定 Emby 配置文件；
 - `--emby-ua <ua>`：覆盖 Emby HTTP `User-Agent`；
 - `--emby-client <name>` / `--emby-device <name>` / `--emby-version <version>`：覆盖 Emby 身份字段；
@@ -211,6 +235,34 @@ pan-relay quark ls /来自：分享
 
 # 多线程并发下载到本地（自动绕过大文件限制）
 pan-relay quark download /来自：分享/电影名.mkv ./ -t 6
+```
+
+---
+
+### 三之二、 天翼云盘独立操作 (`ctyun` / `189` / `tianyi`)
+
+```bash
+# 账号与容量（同时显示个人云/家庭云、根目录 ID）
+pan-relay ctyun whoami
+
+# 浏览目录（默认根目录 /）
+pan-relay ctyun ls /
+pan-relay ctyun ls /我的视频
+
+# 下载（-t 1~8 依线路自行调整；同网直连时单连接通常最快）
+pan-relay ctyun download /我的视频/电影.mkv ./ -t 1
+
+# 分片上传（自动按文件大小选择 10/20/50+ MiB 分片）
+pan-relay ctyun upload ./电影.mkv /我的视频
+
+# 建目录 / 删除 / 刷新令牌
+pan-relay ctyun mkdir / 临时目录
+pan-relay ctyun rm /临时目录/废弃文件.mkv
+pan-relay ctyun refresh
+
+# 零磁盘中转：天翼 -> 沃家 / 天翼 -> 天翼
+pan-relay relay ctyun:/我的视频/电影.mkv wopan:/emby/movies/ --stream -t 4
+pan-relay relay quark:/来自：分享/电影.mkv ctyun:/我的视频 --stream -t 4
 ```
 
 ---
