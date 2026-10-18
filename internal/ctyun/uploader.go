@@ -81,11 +81,11 @@ type commitResp struct {
 	} `json:"file"`
 }
 
-func uploadPrefix(isFamily bool) string {
+func uploadPrefix(base string, isFamily bool) string {
 	if isFamily {
-		return UploadURL + "/family"
+		return base + "/family"
 	}
-	return UploadURL + "/person"
+	return base + "/person"
 }
 
 // UploadLocal uploads a file from disk into parentID and returns its file id.
@@ -159,7 +159,7 @@ func (c *Client) uploadReaderAt(ctx context.Context, parentID, name string, ra i
 	}
 
 	var initRes initUploadResp
-	if err := c.do(ctx, http.MethodGet, uploadPrefix(isFamily)+"/initMultiUpload",
+	if err := c.do(ctx, http.MethodGet, uploadPrefix(c.uploadBase(), isFamily)+"/initMultiUpload",
 		RequestOptions{Encrypted: initParams}, &initRes); err != nil {
 		return "", fmt.Errorf("initMultiUpload: %w", err)
 	}
@@ -228,18 +228,36 @@ func (c *Client) uploadReaderAt(ctx context.Context, parentID, name string, ra i
 	}
 
 	// --- 3. upload parts concurrently (each worker reads its own range) ---
+	// Buffered so failing workers never block on send, and a derived context so
+	// a worker error unblocks the feeder instead of leaking it.
+	upCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	type job struct{ meta partMeta }
-	jobs := make(chan job)
+	jobs := make(chan job, len(parts))
 	errs := make(chan error, len(parts))
 	var wg sync.WaitGroup
 	var doneMu sync.Mutex
 	done := 0
+	var firstErr error
+	var errOnce sync.Once
+
+	fail := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
 
 	worker := func() {
 		defer wg.Done()
 		for j := range jobs {
-			if err := c.uploadPart(ctx, isFamily, uploadFileID, ra, j.meta, opt.Retries); err != nil {
+			if upCtx.Err() != nil {
+				return
+			}
+			if err := c.uploadPart(upCtx, isFamily, uploadFileID, ra, j.meta, opt.Retries); err != nil {
 				errs <- err
+				fail(err)
 				return
 			}
 			doneMu.Lock()
@@ -256,6 +274,9 @@ func (c *Client) uploadReaderAt(ctx context.Context, parentID, name string, ra i
 	if nWorkers > len(parts) {
 		nWorkers = len(parts)
 	}
+	if nWorkers < 1 {
+		nWorkers = 1
+	}
 	for i := 0; i < nWorkers; i++ {
 		wg.Add(1)
 		go worker()
@@ -265,7 +286,7 @@ func (c *Client) uploadReaderAt(ctx context.Context, parentID, name string, ra i
 		defer close(jobs)
 		for _, p := range parts {
 			select {
-			case <-ctx.Done():
+			case <-upCtx.Done():
 				return
 			case jobs <- job{meta: p}:
 			}
@@ -278,6 +299,9 @@ func (c *Client) uploadReaderAt(ctx context.Context, parentID, name string, ra i
 		if e != nil {
 			return "", e
 		}
+	}
+	if firstErr != nil {
+		return "", firstErr
 	}
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -308,7 +332,7 @@ func (c *Client) uploadReaderAt(ctx context.Context, parentID, name string, ra i
 	}
 
 	var commit commitResp
-	if err := c.do(ctx, http.MethodGet, uploadPrefix(isFamily)+"/commitMultiUploadFile",
+	if err := c.do(ctx, http.MethodGet, uploadPrefix(c.uploadBase(), isFamily)+"/commitMultiUploadFile",
 		RequestOptions{Encrypted: commitParams}, &commit); err != nil {
 		return "", fmt.Errorf("commitMultiUploadFile: %w", err)
 	}
@@ -352,7 +376,7 @@ func (c *Client) uploadPart(ctx context.Context, isFamily bool, uploadFileID str
 		}
 
 		var urls uploadURLsResp
-		if err := c.do(ctx, http.MethodGet, uploadPrefix(isFamily)+"/getMultiUploadUrls",
+		if err := c.do(ctx, http.MethodGet, uploadPrefix(c.uploadBase(), isFamily)+"/getMultiUploadUrls",
 			RequestOptions{Encrypted: params}, &urls); err != nil {
 			lastErr = err
 			continue

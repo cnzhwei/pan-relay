@@ -171,6 +171,12 @@ type Client struct {
 	cfg *Config
 	hc  *resty.Client
 
+	// Endpoint overrides. Empty means use the production constants; tests set
+	// them to a local server so no real traffic is generated.
+	authURL   string
+	apiURL    string
+	uploadURL string
+
 	mu         sync.Mutex
 	accessTok  string
 	expiresAt  time.Time
@@ -188,7 +194,46 @@ func NewClient(cfg *Config) *Client {
 	r.SetHeader("Accept", "application/json;charset=UTF-8")
 	r.SetHeader("Referer", WebURL)
 	r.SetHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	return &Client{cfg: cfg, hc: r, accessTok: cfg.AccessToken}
+	return &Client{cfg: cfg, hc: r, accessTok: cfg.AccessToken,
+		authURL: AuthURL, apiURL: APIURL, uploadURL: UploadURL}
+}
+
+// SetEndpoints overrides the API hosts. Intended for tests and mirrors.
+//
+// The endpoint fields are intentionally read without taking c.mu: callers such
+// as getSessionLocked already hold it, and taking it again would self-deadlock.
+// SetEndpoints must therefore be called before the client is used concurrently.
+func (c *Client) SetEndpoints(auth, api, upload string) {
+	if auth != "" {
+		c.authURL = auth
+	}
+	if api != "" {
+		c.apiURL = api
+	}
+	if upload != "" {
+		c.uploadURL = upload
+	}
+}
+
+func (c *Client) authBase() string {
+	if c.authURL == "" {
+		return AuthURL
+	}
+	return c.authURL
+}
+
+func (c *Client) apiBase() string {
+	if c.apiURL == "" {
+		return APIURL
+	}
+	return c.apiURL
+}
+
+func (c *Client) uploadBase() string {
+	if c.uploadURL == "" {
+		return UploadURL
+	}
+	return c.uploadURL
 }
 
 // Config returns the underlying config.
@@ -216,7 +261,9 @@ type refreshResp struct {
 }
 
 type sessionResp struct {
-	ResCode    int    `json:"res_code"`
+	// The API returns res_code as a number on success (0) but as a string on
+	// failure ("UserInvalidOpenToken"), so it must not be typed as int.
+	ResCode    any    `json:"res_code"`
 	ResMessage string `json:"res_message"`
 
 	LoginName     string `json:"loginName"`
@@ -243,7 +290,7 @@ func (c *Client) refreshTokenLocked(ctx context.Context) (int64, error) {
 			"grantType":    "refresh_token",
 			"format":       "json",
 		}).
-		Post(AuthURL + "/api/oauth2/refreshToken.do")
+		Post(c.authBase() + "/api/oauth2/refreshToken.do")
 	if err != nil {
 		return 0, fmt.Errorf("refresh token request failed: %w", err)
 	}
@@ -270,48 +317,54 @@ func (c *Client) refreshTokenLocked(ctx context.Context) (int64, error) {
 	}
 
 	c.cfg.AccessToken = r.AccessToken
-	changed := r.RefreshToken != "" && r.RefreshToken != c.cfg.RefreshToken
 	if r.RefreshToken != "" {
 		c.cfg.RefreshToken = r.RefreshToken
 	}
 	if err := c.cfg.Save(); err != nil {
 		return r.ExpiresIn, fmt.Errorf("token refreshed but config could not be saved: %w", err)
 	}
-	_ = changed
 	return r.ExpiresIn, nil
 }
 
 // EnsureSession makes sure a usable sessionKey/sessionSecret pair exists.
+//
+// The refresh chain is single-active: refreshing twice concurrently would mint
+// two access tokens and invalidate the earlier one, so the whole check-and-login
+// sequence runs under c.mu with a double-check inside the lock. Network calls
+// are made while holding the lock on purpose — only one goroutine may refresh.
 func (c *Client) EnsureSession(ctx context.Context) error {
 	c.mu.Lock()
-	need := c.sessionKey == "" || c.sessSecret == ""
-	c.mu.Unlock()
-	if !need {
+	defer c.mu.Unlock()
+	return c.ensureSessionLocked(ctx)
+}
+
+func (c *Client) ensureSessionLocked(ctx context.Context) error {
+	if c.sessionKey != "" && c.sessSecret != "" {
 		return nil
 	}
 
 	if c.accessTok == "" {
-		if _, err := c.RefreshToken(ctx); err != nil {
+		if _, err := c.refreshTokenLocked(ctx); err != nil {
 			return err
 		}
 	}
-	if err := c.getSession(ctx); err != nil {
+	if err := c.getSessionLocked(ctx); err != nil {
 		// An invalid access token (UserInvalidOpenToken) is recoverable: the
 		// token may have been superseded, so refresh and retry once.
-		if _, rerr := c.RefreshToken(ctx); rerr != nil {
+		if _, rerr := c.refreshTokenLocked(ctx); rerr != nil {
 			return fmt.Errorf("%w (refresh retry failed: %v)", err, rerr)
 		}
-		if err := c.getSession(ctx); err != nil {
+		if err := c.getSessionLocked(ctx); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Client) getSession(ctx context.Context) error {
-	c.mu.Lock()
+// getSessionLocked exchanges the current access token for a session pair.
+// The caller must hold c.mu.
+func (c *Client) getSessionLocked(ctx context.Context) error {
 	at := c.accessTok
-	c.mu.Unlock()
 
 	resp, err := c.hc.R().SetContext(ctx).
 		SetQueryParams(map[string]string{
@@ -322,7 +375,7 @@ func (c *Client) getSession(ctx context.Context) error {
 			"returnType":  "JSON",
 			"accessToken": at,
 		}).
-		Get(APIURL + "/getSessionForPC.action")
+		Get(c.apiBase() + "/getSessionForPC.action")
 	if err != nil {
 		return fmt.Errorf("getSessionForPC request failed: %w", err)
 	}
@@ -331,17 +384,17 @@ func (c *Client) getSession(ctx context.Context) error {
 	if err := json.Unmarshal(resp.Body(), &s); err != nil {
 		return fmt.Errorf("getSessionForPC: unexpected response: %w", err)
 	}
-	if s.ResCode != 0 || s.SessionKey == "" {
+	if !isZeroResCode(s.ResCode) || s.SessionKey == "" {
 		return fmt.Errorf("getSessionForPC rejected (res_code=%v): %s", s.ResCode, s.ResMessage)
 	}
 
-	c.mu.Lock()
+	// The caller (ensureSessionLocked) already holds c.mu, so assigning
+	// directly is required — taking the lock here would self-deadlock.
 	c.sessionKey, c.sessSecret = s.SessionKey, s.SessionSecret
 	c.famKey, c.famSecret = s.FamilySessionKey, s.FamilySessionSecret
 	if s.LoginName != "" {
 		c.loginName = s.LoginName
 	}
-	c.mu.Unlock()
 	return nil
 }
 
@@ -360,9 +413,19 @@ func clientSuffix() map[string]string {
 
 var urlPathPattern = regexp.MustCompile(`://[^/]+((/[^/\s?#]+)*)`)
 
+// requestPath extracts the path component used in the HMAC signature.
+// It must be the path only (no host, no query) and must return "/" for a
+// bare-origin URL, otherwise the signature will not match the server's.
 func requestPath(fullURL string) string {
+	if u, err := url.Parse(fullURL); err == nil {
+		if u.Path == "" {
+			return "/"
+		}
+		return u.Path
+	}
+	// Fallback for inputs url.Parse rejects.
 	m := urlPathPattern.FindStringSubmatch(fullURL)
-	if len(m) < 2 {
+	if len(m) < 2 || m[1] == "" {
 		return "/"
 	}
 	return m[1]
@@ -448,9 +511,15 @@ func (c *Client) do(ctx context.Context, method, fullURL string, opt RequestOpti
 func (c *Client) doWithRetry(ctx context.Context, method, fullURL string, opt RequestOptions, result interface{}, allowRetry bool) error {
 	c.mu.Lock()
 	sk, ss := c.sessionKey, c.sessSecret
+	// Family cloud endpoints authenticate with their own session pair; using
+	// the personal one produces a signature mismatch on every family call.
+	if c.cfg.IsFamily() && c.famKey != "" && c.famSecret != "" {
+		sk, ss = c.famKey, c.famSecret
+	}
 	c.mu.Unlock()
-	if c.cfg.IsFamily() && c.famKey != "" {
-		// Family endpoints use their own session pair.
+
+	if len(ss) < 16 {
+		return fmt.Errorf("invalid session secret: got %d bytes, need at least 16", len(ss))
 	}
 
 	paramsHex := ""
@@ -494,14 +563,14 @@ func (c *Client) doWithRetry(ctx context.Context, method, fullURL string, opt Re
 	if allowRetry && (bytes.Contains(body, []byte("InvalidSessionKey")) ||
 		bytes.Contains(body, []byte("userSessionBO is null")) ||
 		bytes.Contains(body, []byte("UserInvalidOpenToken"))) {
+		// Take the lock before clearing state so a concurrent recovery cannot
+		// start a second, competing refresh.
 		c.mu.Lock()
 		c.sessionKey, c.sessSecret = "", ""
+		rerr := c.ensureSessionLocked(ctx)
 		c.mu.Unlock()
-		if _, rerr := c.RefreshToken(ctx); rerr != nil {
-			return fmt.Errorf("session expired and refresh failed: %w", rerr)
-		}
-		if serr := c.getSession(ctx); serr != nil {
-			return fmt.Errorf("session expired and re-login failed: %w", serr)
+		if rerr != nil {
+			return fmt.Errorf("session expired and re-login failed: %w", rerr)
 		}
 		return c.doWithRetry(ctx, method, fullURL, opt, result, false)
 	}
@@ -597,7 +666,7 @@ func (c *Client) ListDir(ctx context.Context, folderID string) ([]FileItem, erro
 	var out []FileItem
 	for page := 1; ; page++ {
 		var r listResp
-		err := c.do(ctx, http.MethodGet, APIURL+"/listFiles.action", RequestOptions{
+		err := c.do(ctx, http.MethodGet, c.apiBase()+"/listFiles.action", RequestOptions{
 			Plain: map[string]string{
 				"folderId":   folderID,
 				"fileType":   "0",
@@ -726,7 +795,7 @@ type downloadURLResp struct {
 // GetDownloadURL returns a directly usable CDN URL for the given file id.
 func (c *Client) GetDownloadURL(ctx context.Context, fileID string) (string, error) {
 	var r downloadURLResp
-	err := c.do(ctx, http.MethodGet, APIURL+"/getFileDownloadUrl.action", RequestOptions{
+	err := c.do(ctx, http.MethodGet, c.apiBase()+"/getFileDownloadUrl.action", RequestOptions{
 		Plain: map[string]string{
 			"fileId": fileID,
 			"dt":     "3",
@@ -785,7 +854,7 @@ func (c *Client) Mkdir(ctx context.Context, parentID, name string) (string, erro
 		parentID = DefaultRootID
 	}
 	var r folderResp
-	err := c.do(ctx, http.MethodPost, APIURL+"/createFolder.action", RequestOptions{
+	err := c.do(ctx, http.MethodPost, c.apiBase()+"/createFolder.action", RequestOptions{
 		Plain: map[string]string{
 			"folderName":     name,
 			"relativePath":   "",
@@ -834,7 +903,7 @@ func (c *Client) Remove(ctx context.Context, item FileItem) error {
 	}
 
 	var r batchTaskResp
-	err = c.do(ctx, http.MethodPost, APIURL+"/batch/createBatchTask.action", RequestOptions{
+	err = c.do(ctx, http.MethodPost, c.apiBase()+"/batch/createBatchTask.action", RequestOptions{
 		Form: map[string]string{
 			"type":      "DELETE",
 			"taskInfos": string(infos),
@@ -851,7 +920,7 @@ func (c *Client) Remove(ctx context.Context, item FileItem) error {
 	for i := 0; i < 40; i++ {
 		time.Sleep(300 * time.Millisecond)
 		var st batchTaskStateResp
-		err := c.do(ctx, http.MethodPost, APIURL+"/batch/checkBatchTask.action", RequestOptions{
+		err := c.do(ctx, http.MethodPost, c.apiBase()+"/batch/checkBatchTask.action", RequestOptions{
 			Form: map[string]string{"type": "DELETE", "taskId": r.TaskID},
 		}, &st)
 		if err != nil {
@@ -888,7 +957,7 @@ type capacityResp struct {
 // Capacity returns total/used bytes for the configured space.
 func (c *Client) Capacity(ctx context.Context) (total, used int64, err error) {
 	var r capacityResp
-	if err := c.do(ctx, http.MethodGet, APIURL+"/portal/getUserSizeInfo.action", RequestOptions{}, &r); err != nil {
+	if err := c.do(ctx, http.MethodGet, c.apiBase()+"/portal/getUserSizeInfo.action", RequestOptions{}, &r); err != nil {
 		return 0, 0, err
 	}
 	if c.cfg.IsFamily() {
@@ -899,3 +968,21 @@ func (c *Client) Capacity(ctx context.Context) (total, used int64, err error) {
 
 // EscapeFileName mirrors the driver's URL escaping of upload file names.
 func EscapeFileName(name string) string { return url.QueryEscape(name) }
+
+// isZeroResCode reports whether an API res_code represents success.
+// The field arrives as a JSON number (0) on success and as a string on error,
+// so it is decoded into any and compared loosely.
+func isZeroResCode(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return true
+	case float64:
+		return t == 0
+	case int:
+		return t == 0
+	case string:
+		return t == "" || t == "0"
+	default:
+		return false
+	}
+}

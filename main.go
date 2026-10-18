@@ -25,7 +25,7 @@ import (
 	"github.com/cnzhwei/pan-relay/internal/uploader"
 )
 
-var Version = "2.3.0"
+var Version = "2.3.1"
 
 const maxConcurrency = 32
 
@@ -187,6 +187,28 @@ func main() {
 	}
 }
 
+// resolveCTYunSource accepts either a remote path ("/dir/file.mkv") or a bare
+// numeric file id, matching the `ctyun download` command.
+func resolveCTYunSource(ctx context.Context, c *ctyun.Client, src string) (*ctyun.FileItem, error) {
+	trimmed := strings.TrimSpace(src)
+	if trimmed != "" && !strings.Contains(trimmed, "/") && isAllDigits(trimmed) {
+		return &ctyun.FileItem{ID: trimmed, Name: trimmed}, nil
+	}
+	return c.FindFile(ctx, trimmed)
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 // -----------------------------------------------------------------------------
 // Relay Implementation
 // -----------------------------------------------------------------------------
@@ -304,7 +326,7 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			os.Exit(1)
 		}
 		cClient := ctyun.NewClient(cCfg)
-		item, err := cClient.FindFile(ctx, srcPath)
+		item, err := resolveCTYunSource(ctx, cClient, srcPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Tianyi source error: %v\n", err)
 			os.Exit(1)
@@ -391,7 +413,7 @@ func handleRelayCommand(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 }
 
 func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConfig, ctyunConfig, embyConfig string, embyOverrides emby.ConfigOverrides, srcCloud, srcPath, dstCloud, dstPath string, threads int) {
-	if dstCloud != "wopan" && dstCloud != "ctyun" && dstCloud != "189" {
+	if dstCloud != "wopan" && dstCloud != "ctyun" && dstCloud != "189" && dstCloud != "tianyi" {
 		fmt.Fprintf(os.Stderr, "Unsupported destination cloud for stream relay: %s (supported: wopan, ctyun)\n", dstCloud)
 		os.Exit(1)
 	}
@@ -400,7 +422,6 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 		wClient     *client.Client
 		wCfg        *config.Config
 		cDstClient  *ctyun.Client
-		cDstCfg     *ctyun.Config
 		targetDirID string
 	)
 
@@ -426,13 +447,12 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			os.Exit(1)
 		}
 	} else {
-		var err error
-		cDstCfg, err = ctyun.LoadConfig(ctyunConfig)
+		dstCfg, err := ctyun.LoadConfig(ctyunConfig)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Tianyi Config Error: %v\n", err)
 			os.Exit(1)
 		}
-		cDstClient = ctyun.NewClient(cDstCfg)
+		cDstClient = ctyun.NewClient(dstCfg)
 		targetDirID, err = cDstClient.ResolveDir(ctx, dstPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error resolving Tianyi directory %q: %v\n", dstPath, err)
@@ -669,7 +689,7 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 			os.Exit(1)
 		}
 		cClient := ctyun.NewClient(cCfg)
-		item, err := cClient.FindFile(ctx, srcPath)
+		item, err := resolveCTYunSource(ctx, cClient, srcPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Tianyi source error: %v\n", err)
 			os.Exit(1)
@@ -722,7 +742,6 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 		}
 		fid, err = cDstClient.UploadStream(ctx, targetDirID, fileName, fileSize, ctyun.PartReaderFunc(getPartReader), upOpt)
 	}
-	_ = cDstCfg
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Stream relay upload failed: %v\n", err)
 		os.Exit(1)

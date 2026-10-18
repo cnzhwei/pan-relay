@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cnzhwei/pan-relay/internal/ctyun"
@@ -100,7 +101,7 @@ func handleCTYunCommand(ctx context.Context, configPath string, threads int, arg
 		target := rest[0]
 
 		var item *ctyun.FileItem
-		if strings.Contains(target, "/") || !looksLikeID(target) {
+		if strings.Contains(target, "/") || !isAllDigits(target) {
 			item, err = cl.FindFile(ctx, target)
 		} else {
 			item = &ctyun.FileItem{ID: target, Name: target}
@@ -110,11 +111,19 @@ func handleCTYunCommand(ctx context.Context, configPath string, threads int, arg
 			os.Exit(1)
 		}
 
-		output := item.Name
+		// Never trust a remote-supplied name for a local path: reduce it to a
+		// bare base name so a crafted "..\..\etc\cron.d/x" cannot escape the
+		// working directory.
+		safeName := filepath.Base(filepath.Clean("/" + item.Name))
+		if safeName == "" || safeName == "." || safeName == "/" {
+			safeName = "download.bin"
+		}
+
+		output := safeName
 		if len(rest) > 1 {
 			output = rest[1]
 			if fi, err := os.Stat(output); err == nil && fi.IsDir() {
-				output = filepath.Join(output, item.Name)
+				output = filepath.Join(output, safeName)
 			}
 		}
 
@@ -249,18 +258,6 @@ func handleCTYunCommand(ctx context.Context, configPath string, threads int, arg
 	}
 }
 
-func looksLikeID(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
 func humanSize(n int64) string {
 	const unit = 1024
 	if n < unit {
@@ -274,9 +271,14 @@ func humanSize(n int64) string {
 	return fmt.Sprintf("%.2f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
+// progressPrinter returns a callback that is safe to call from multiple
+// goroutines: the rate-limit timestamp and the terminal writes are serialised.
 func progressPrinter(start time.Time) func(int) {
+	var mu sync.Mutex
 	last := time.Duration(0)
 	return func(pct int) {
+		mu.Lock()
+		defer mu.Unlock()
 		el := time.Since(start)
 		if el-last < 300*time.Millisecond && pct < 100 {
 			return
@@ -289,9 +291,14 @@ func progressPrinter(start time.Time) func(int) {
 	}
 }
 
+// progressBytes returns a byte-oriented progress callback that is safe to call
+// from multiple goroutines.
 func progressBytes(start time.Time) func(int64, int64) {
+	var mu sync.Mutex
 	last := time.Duration(0)
 	return func(written, total int64) {
+		mu.Lock()
+		defer mu.Unlock()
 		el := time.Since(start)
 		if el-last < 300*time.Millisecond && (total <= 0 || written < total) {
 			return

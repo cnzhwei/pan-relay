@@ -23,6 +23,11 @@ const DownloadChunkSize = int64(8 << 20)
 // 4 connections were faster than 1. Tune with -t if throughput looks off.
 const DefaultDownloadConcurrency = 4
 
+// partSuffix marks an in-flight download. A file without this suffix is only
+// ever created by the final atomic rename, so its presence is proof of
+// completion rather than an inference from file size.
+const partSuffix = ".part"
+
 // DownloadOptions configures a download.
 type DownloadOptions struct {
 	Concurrency  int
@@ -31,7 +36,12 @@ type DownloadOptions struct {
 	Progress     func(written, total int64)
 }
 
-// Download fetches a URL to outputPath, resuming in chunks when possible.
+// Download fetches a URL to outputPath.
+//
+// Bytes are written to outputPath+".part" and renamed into place only after the
+// full expected length has been received. A crashed or cancelled run therefore
+// leaves a distinguishable partial file, never a full-size file of zeros that a
+// later invocation could mistake for a completed download.
 func Download(ctx context.Context, downloadURL string, customHeaders http.Header, outputPath string, opt DownloadOptions) error {
 	if opt.Concurrency <= 0 {
 		opt.Concurrency = DefaultDownloadConcurrency
@@ -57,20 +67,50 @@ func Download(ctx context.Context, downloadURL string, customHeaders http.Header
 	if err != nil {
 		return err
 	}
+	if size <= 0 {
+		return fmt.Errorf("unable to determine remote size; refusing an unverifiable download")
+	}
 
-	if size > 0 {
-		if fi, err := os.Stat(outputPath); err == nil && fi.Size() == size {
-			if opt.Progress != nil {
-				opt.Progress(size, size)
-			}
-			return nil // already complete
+	partPath := outputPath + partSuffix
+	if dir := filepath.Dir(partPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
 		}
 	}
 
-	if !supportsRange || size <= 0 || opt.Concurrency == 1 {
-		return downloadSingle(ctx, client, downloadURL, customHeaders, outputPath, size, opt)
+	// A previously completed download is only trusted when the final path
+	// exists at the exact size (the .part file is never renamed early).
+	if fi, err := os.Stat(outputPath); err == nil && fi.Size() == size {
+		if opt.Progress != nil {
+			opt.Progress(size, size)
+		}
+		return nil
 	}
-	return downloadChunked(ctx, client, downloadURL, customHeaders, outputPath, size, opt)
+
+	var dlErr error
+	if supportsRange && opt.Concurrency > 1 {
+		dlErr = downloadChunked(ctx, client, downloadURL, customHeaders, partPath, size, opt)
+	} else {
+		dlErr = downloadSingle(ctx, client, downloadURL, customHeaders, partPath, size, opt)
+	}
+	if dlErr != nil {
+		// Keep the .part for a resumed retry, but never leave a file that looks
+		// complete.
+		return dlErr
+	}
+
+	// Verify the assembled size before publishing the result.
+	fi, err := os.Stat(partPath)
+	if err != nil {
+		return fmt.Errorf("download finished but the part file is missing: %w", err)
+	}
+	if fi.Size() != size {
+		return fmt.Errorf("download size mismatch: got %d bytes, want %d", fi.Size(), size)
+	}
+	if err := os.Rename(partPath, outputPath); err != nil {
+		return fmt.Errorf("failed to publish downloaded file: %w", err)
+	}
+	return nil
 }
 
 func probe(client *http.Client, ctx context.Context, u string, hdr http.Header) (int64, bool, error) {
@@ -119,15 +159,14 @@ func newRequest(ctx context.Context, u string, hdr http.Header) (*http.Request, 
 	return req, nil
 }
 
+// downloadSingle streams the whole body, resuming from an existing .part when
+// the server supports Range.
 func downloadSingle(ctx context.Context, client *http.Client, u string, hdr http.Header,
 	out string, size int64, opt DownloadOptions) error {
 
-	// Resume a partial file when the server supports Range.
 	var offset int64
-	if fi, err := os.Stat(out); err == nil && size > 0 && fi.Size() < size {
+	if fi, err := os.Stat(out); err == nil && fi.Size() > 0 && fi.Size() < size {
 		offset = fi.Size()
-	} else if err == nil && size <= 0 {
-		offset = 0
 	}
 
 	req, err := newRequest(ctx, u, hdr)
@@ -154,22 +193,13 @@ func downloadSingle(ctx context.Context, client *http.Client, u string, hdr http
 		flags |= os.O_TRUNC
 		offset = 0
 	}
-	if dir := filepath.Dir(out); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
-	}
 	f, err := os.OpenFile(out, flags, 0644)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	var written int64 = offset
-	total := size
-	if total <= 0 {
-		total = resp.ContentLength
-	}
+	written := offset
 	buf := make([]byte, 1<<20)
 	last := time.Now()
 	for {
@@ -180,7 +210,7 @@ func downloadSingle(ctx context.Context, client *http.Client, u string, hdr http
 			}
 			written += int64(n)
 			if opt.Progress != nil && time.Since(last) > 200*time.Millisecond {
-				opt.Progress(written, total)
+				opt.Progress(written, size)
 				last = time.Now()
 			}
 		}
@@ -195,11 +225,19 @@ func downloadSingle(ctx context.Context, client *http.Client, u string, hdr http
 		}
 	}
 	if opt.Progress != nil {
-		opt.Progress(written, total)
+		opt.Progress(written, size)
+	}
+	if written != size {
+		return fmt.Errorf("short download: got %d bytes, want %d", written, size)
 	}
 	return nil
 }
 
+// downloadChunked splits the file into Range spans fetched by a worker pool.
+//
+// Cancellation contract: the dispatch loop selects on a derived context that
+// any failing worker cancels, so a worker error can never leave the loop
+// blocked on an unbuffered send.
 func downloadChunked(ctx context.Context, client *http.Client, u string, hdr http.Header,
 	out string, size int64, opt DownloadOptions) error {
 
@@ -208,14 +246,7 @@ func downloadChunked(ctx context.Context, client *http.Client, u string, hdr htt
 		chunk = 8 << 20
 	}
 
-	// Preallocate the file so writes can seek freely.
-	dir := filepath.Dir(out)
-	if dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return err
-		}
-	}
-	f, err := os.OpenFile(out, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(out, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
@@ -234,50 +265,68 @@ func downloadChunked(ctx context.Context, client *http.Client, u string, hdr htt
 		spans = append(spans, span{start, end})
 	}
 
+	dlCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var written int64
-	var wmu sync.Mutex
-	jobs := make(chan span)
-	errs := make(chan error, len(spans))
+	var progressMu sync.Mutex
+	var firstErr error
+	var errOnce sync.Once
 	var wg sync.WaitGroup
+
+	// Buffered so workers never block trying to report an error.
+	jobs := make(chan span, len(spans))
+	for _, sp := range spans {
+		jobs <- sp
+	}
+	close(jobs)
+
+	fail := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+			cancel() // unblock any peer workers still fetching
+		})
+	}
 
 	worker := func() {
 		defer wg.Done()
 		buf := make([]byte, 1<<20)
 		for sp := range jobs {
-			if err := fetchSpan(ctx, client, u, hdr, f, sp.start, sp.end, buf, &written, &wmu, size, opt); err != nil {
-				errs <- err
+			if dlCtx.Err() != nil {
+				return
+			}
+			if err := fetchSpan(dlCtx, client, u, hdr, f, sp.start, sp.end, buf,
+				&written, &progressMu, size, opt); err != nil {
+				fail(err)
 				return
 			}
 		}
 	}
 
 	n := opt.Concurrency
+	if n > len(spans) {
+		n = len(spans)
+	}
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go worker()
 	}
-	for _, sp := range spans {
-		select {
-		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			return ctx.Err()
-		case jobs <- sp:
-		}
-	}
-	close(jobs)
 	wg.Wait()
-	close(errs)
-	for e := range errs {
-		if e != nil {
-			return e
-		}
+
+	if firstErr != nil {
+		return firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if got := atomic.LoadInt64(&written); got != size {
+		return fmt.Errorf("chunked download incomplete: %d/%d bytes", got, size)
 	}
 	return nil
 }
 
 func fetchSpan(ctx context.Context, client *http.Client, u string, hdr http.Header, f *os.File,
-	start, end int64, buf []byte, written *int64, wmu *sync.Mutex, total int64, opt DownloadOptions) error {
+	start, end int64, buf []byte, written *int64, progressMu *sync.Mutex, total int64, opt DownloadOptions) error {
 
 	req, err := newRequest(ctx, u, hdr)
 	if err != nil {
@@ -301,11 +350,11 @@ func fetchSpan(ctx context.Context, client *http.Client, u string, hdr http.Head
 				return werr
 			}
 			pos += int64(n)
-			atomic.AddInt64(written, int64(n))
+			cur := atomic.AddInt64(written, int64(n))
 			if opt.Progress != nil {
-				wmu.Lock()
-				opt.Progress(atomic.LoadInt64(written), total)
-				wmu.Unlock()
+				progressMu.Lock()
+				opt.Progress(cur, total)
+				progressMu.Unlock()
 			}
 		}
 		if rerr == io.EOF {
