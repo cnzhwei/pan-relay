@@ -21,6 +21,7 @@ type Client struct {
 
 func New(cfg *config.Config) (*Client, error) {
 	w := wopan.DefaultWithRefreshToken(cfg.RefreshToken)
+	w.SetUserAgent(wopan.DefaultUA)
 	if cfg.AccessToken != "" {
 		w.SetAccessToken(cfg.AccessToken)
 	}
