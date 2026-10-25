@@ -606,12 +606,21 @@ func (c *Client) PartReader(ctx context.Context, itemID, sourceID string, offset
 
 func (c *Client) FileName(item Item, info MediaInfo) string {
 	name := strings.TrimSpace(item.Name)
+	for _, ms := range item.MediaSources {
+		if ms.ID == info.SourceID && strings.TrimSpace(ms.Name) != "" {
+			name = strings.TrimSpace(ms.Name)
+			break
+		}
+	}
 	if name == "" {
 		name = "emby-" + item.ID
 	}
 	ext := strings.TrimPrefix(strings.ToLower(info.Container), ".")
 	if ext == "" {
 		ext = "mkv"
+	}
+	if strings.HasSuffix(strings.ToLower(name), "."+ext) {
+		return name
 	}
 	return name + "." + ext
 }
