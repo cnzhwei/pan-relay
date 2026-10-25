@@ -2,6 +2,7 @@ package emby
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -196,6 +197,9 @@ func newHTTPTransport(proxyRaw string) (*http.Transport, error) {
 		return nil, err
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	transport.ResponseHeaderTimeout = 60 * time.Second
 	if proxyURL == "" {
 		return transport, nil
 	}
