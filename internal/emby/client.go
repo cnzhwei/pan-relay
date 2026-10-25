@@ -198,6 +198,9 @@ func newHTTPTransport(proxyRaw string) (*http.Transport, error) {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ForceAttemptHTTP2 = false
+	transport.TLSClientConfig = &tls.Config{
+		NextProtos: []string{"http/1.1"},
+	}
 	transport.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	transport.ResponseHeaderTimeout = 60 * time.Second
 	if proxyURL == "" {
