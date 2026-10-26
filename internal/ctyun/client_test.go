@@ -31,6 +31,26 @@ func TestPartSize(t *testing.T) {
 	}
 }
 
+func TestCalculateMaxWindows(t *testing.T) {
+	cases := []struct {
+		winSize int64
+		want    int
+	}{
+		{0, 8},
+		{10 << 20, 8}, // 80MB / 10MB = 8
+		{20 << 20, 4}, // 80MB / 20MB = 4
+		{50 << 20, 2}, // 80MB / 50MB = 1 -> min clamp 2
+		{60 << 20, 2}, // min clamp 2
+		{100 << 20, 2},
+	}
+	for _, c := range cases {
+		got := CalculateMaxWindows(c.winSize)
+		if got != c.want {
+			t.Errorf("CalculateMaxWindows(%d) = %d, want %d", c.winSize, got, c.want)
+		}
+	}
+}
+
 func TestSignAndEncrypt(t *testing.T) {
 	// Golden values produced from the algorithm description: the signature is
 	// HMAC-SHA1 over the canonical string, upper-case hex.

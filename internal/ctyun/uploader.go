@@ -402,8 +402,7 @@ func (c *Client) uploadPart(ctx context.Context, isFamily bool, uploadFileID str
 			}
 		}
 
-		client := &http.Client{Timeout: 15 * time.Minute}
-		resp, err := client.Do(req)
+		resp, err := c.UploadHTTPClient().Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("put part %d: %w", m.index, err)
 			continue

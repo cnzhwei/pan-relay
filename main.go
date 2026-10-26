@@ -716,7 +716,7 @@ func executeStreamRelay(ctx context.Context, wopanConfig, quarkConfig, baiduConf
 		}
 
 	default:
-		fmt.Fprintf(os.Stderr, "Unsupported source cloud for stream relay: %s (supported: quark, baidu, ctyun)\n", srcCloud)
+		fmt.Fprintf(os.Stderr, "Unsupported source cloud for stream relay: %s (supported: quark, baidu, ctyun, emby)\n", srcCloud)
 		os.Exit(1)
 	}
 

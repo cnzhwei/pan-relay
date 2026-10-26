@@ -12,11 +12,30 @@ import (
 // zero-disk stream relay). It mirrors uploader.PartReaderFunc.
 type PartReaderFunc func(ctx context.Context, offset int64, size int64) (io.Reader, error)
 
-// windowCacheSize is the number of PartSize-aligned windows kept in memory.
-// The uploader first walks the file sequentially to hash every part and then
-// re-reads each part once while pushing, so a handful of windows is enough to
-// serve the common access pattern without re-fetching.
-const windowCacheSize = 8
+// maxStreamMemoryBudget is the target memory ceiling for cached windows.
+// For <=10GiB files (10MiB slices), 8 windows = 80MiB.
+// For larger files (20-50+ MiB slices), windows are dynamically scaled down
+// to keep total memory bounded and prevent OOM on 512M/1G VPS environments.
+const (
+	maxStreamMemoryBudget = int64(80 << 20) // 80 MiB ceiling
+	defaultMaxWindows     = 8
+	minWindows            = 2
+)
+
+// CalculateMaxWindows computes how many cached windows to keep based on the slice size.
+func CalculateMaxWindows(windowSize int64) int {
+	if windowSize <= 0 {
+		return defaultMaxWindows
+	}
+	maxWin := int(maxStreamMemoryBudget / windowSize)
+	if maxWin > defaultMaxWindows {
+		maxWin = defaultMaxWindows
+	}
+	if maxWin < minWindows {
+		maxWin = minWindows
+	}
+	return maxWin
+}
 
 type cacheEntry struct {
 	start int64
@@ -30,10 +49,11 @@ type cacheEntry struct {
 // share a single in-flight fetch (per-window single-flight) instead of
 // serialising all workers behind one global mutex.
 type remoteReaderAt struct {
-	ctx   context.Context
-	total int64
-	fetch PartReaderFunc
-	win   int64
+	ctx        context.Context
+	total      int64
+	fetch      PartReaderFunc
+	win        int64
+	maxWindows int
 
 	mu       sync.Mutex
 	lru      *list.List              // front = most recently used
@@ -54,13 +74,14 @@ func NewRemoteReaderAt(ctx context.Context, total int64, fetch PartReaderFunc) i
 		w = 10 << 20
 	}
 	return &remoteReaderAt{
-		ctx:      ctx,
-		total:    total,
-		fetch:    fetch,
-		win:      w,
-		lru:      list.New(),
-		items:    make(map[int64]*list.Element),
-		inflight: make(map[int64]*windowFetch),
+		ctx:        ctx,
+		total:      total,
+		fetch:      fetch,
+		win:        w,
+		maxWindows: CalculateMaxWindows(w),
+		lru:        list.New(),
+		items:      make(map[int64]*list.Element),
+		inflight:   make(map[int64]*windowFetch),
 	}
 }
 
@@ -111,7 +132,7 @@ func (r *remoteReaderAt) getWindow(start int64) ([]byte, error) {
 	if err == nil && len(data) > 0 {
 		el := r.lru.PushFront(&cacheEntry{start: start, data: data})
 		r.items[start] = el
-		for r.lru.Len() > windowCacheSize {
+		for r.lru.Len() > r.maxWindows {
 			back := r.lru.Back()
 			if back == nil {
 				break

@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -177,14 +178,15 @@ type Client struct {
 	apiURL    string
 	uploadURL string
 
-	mu         sync.Mutex
-	accessTok  string
-	expiresAt  time.Time
-	sessionKey string
-	sessSecret string
-	famKey     string
-	famSecret  string
-	loginName  string
+	mu               sync.Mutex
+	accessTok        string
+	expiresAt        time.Time
+	sessionKey       string
+	sessSecret       string
+	famKey           string
+	famSecret        string
+	loginName        string
+	uploadHTTPClient *http.Client
 }
 
 // NewClient builds a client. No network calls are made until first use.
@@ -213,6 +215,29 @@ func (c *Client) SetEndpoints(auth, api, upload string) {
 	if upload != "" {
 		c.uploadURL = upload
 	}
+}
+
+// UploadHTTPClient returns the shared HTTP client with connection pooling for part uploads.
+func (c *Client) UploadHTTPClient() *http.Client {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.uploadHTTPClient == nil {
+		c.uploadHTTPClient = &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   15 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				MaxIdleConns:        64,
+				MaxIdleConnsPerHost: 16,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 15 * time.Second,
+			},
+			Timeout: 15 * time.Minute,
+		}
+	}
+	return c.uploadHTTPClient
 }
 
 func (c *Client) authBase() string {
